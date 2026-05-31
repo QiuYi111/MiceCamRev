@@ -1,0 +1,29 @@
+[project]
+name = "micecam"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "QiuYi111", email = "2513868362@qq.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pyqt6>=6.11.0",
+]
+
+[project.scripts]
+micecam = "micecam.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
+    "pytest>=9.0.3",
+]
