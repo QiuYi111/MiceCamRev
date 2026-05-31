@@ -1,5 +1,6 @@
 """
-Main application window — orchestrates two camera panels side by side.
+Main application window — orchestrates two camera panels side by side
+with soft-sync dual-camera recording via SyncController.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from typing import Optional
 from PyQt6 import QtCore, QtWidgets
 
 from micecam.camera_manager import CameraInfo, list_cameras
+from micecam.core.sync_controller import SyncController
 from micecam.gui.camera_panel import CameraPanel
 
 logger = logging.getLogger(__name__)
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class MainWindow(QtWidgets.QMainWindow):
     """
-    Top-level window with two camera panels, a menu bar, and a status bar.
+    Top-level window with two camera panels, sync controls, and status bar.
 
     Layout::
 
@@ -29,23 +31,24 @@ class MainWindow(QtWidgets.QMainWindow):
         │   Camera 1 Panel      │    Camera 2 Panel            │
         │   ┌───────────────┐   │    ┌───────────────┐        │
         │   │   Preview     │   │    │   Preview     │        │
-        │   │               │   │    │               │        │
         │   └───────────────┘   │    └───────────────┘        │
-        │   [Settings...]       │    [Settings...]             │
         │   [● Record]          │    [● Record]               │
         ├───────────────────────┴──────────────────────────────┤
-        │  Status: Ready  |  Camera 1: idle  |  Camera 2: idle │
+        │  [▶ Start Both]  [■ Stop Both]   (soft-sync)        │
+        ├──────────────────────────────────────────────────────┤
+        │  Status: Ready                                       │
         └──────────────────────────────────────────────────────┘
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("MiceCam — Dual Camera Recorder")
-        self.setMinimumSize(1100, 650)
+        self.setMinimumSize(1100, 700)
 
         self._cameras: list[CameraInfo] = []
         self._panel1: Optional[CameraPanel] = None
         self._panel2: Optional[CameraPanel] = None
+        self._sync = SyncController()
 
         self._build_ui()
         self._discover_cameras()
@@ -53,7 +56,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── UI construction ──────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # Central widget
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         main_layout = QtWidgets.QVBoxLayout(central)
@@ -64,18 +66,57 @@ class MainWindow(QtWidgets.QMainWindow):
         panels_layout = QtWidgets.QHBoxLayout()
         panels_layout.setSpacing(8)
 
-        # Placeholder panels — populated after camera discovery
         self._panel1 = CameraPanel(0, [], self)
         self._panel2 = CameraPanel(1, [], self)
         panels_layout.addWidget(self._panel1)
         panels_layout.addWidget(self._panel2)
         main_layout.addLayout(panels_layout)
 
-        # Status bar
+        # ── Sync control bar ──────────────────────────────────────
+        sync_bar = QtWidgets.QHBoxLayout()
+        sync_bar.setSpacing(8)
+
+        sync_label = QtWidgets.QLabel("Sync Control:")
+        sync_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        sync_bar.addWidget(sync_label)
+
+        self._start_both_btn = QtWidgets.QPushButton("▶  Start Both (Synced)")
+        self._start_both_btn.setMinimumHeight(32)
+        self._start_both_btn.setToolTip(
+            "Start both cameras simultaneously with a shared time base.\n"
+            "Both SRT files will reference the same wall clock for "
+            "post-hoc frame alignment."
+        )
+        self._start_both_btn.setStyleSheet(
+            "QPushButton { background: #27ae60; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #2ecc71; }"
+            "QPushButton:disabled { background: #555; color: #999; }"
+        )
+        self._start_both_btn.clicked.connect(self._start_both)
+        sync_bar.addWidget(self._start_both_btn)
+
+        self._stop_both_btn = QtWidgets.QPushButton("■  Stop Both")
+        self._stop_both_btn.setMinimumHeight(32)
+        self._stop_both_btn.setToolTip("Stop all active recordings.")
+        self._stop_both_btn.setStyleSheet(
+            "QPushButton { background: #555; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #777; }"
+            "QPushButton:disabled { background: #444; color: #777; }"
+        )
+        self._stop_both_btn.clicked.connect(self._stop_both)
+        self._stop_both_btn.setEnabled(False)
+        sync_bar.addWidget(self._stop_both_btn)
+
+        sync_bar.addStretch()
+        main_layout.addLayout(sync_bar)
+
+        # ── Status bar ─────────────────────────────────────────────
         self._status_bar = self.statusBar()
         self._status_bar.showMessage("Discovering cameras...")
 
-        # Menu bar
+        # ── Menu bar ───────────────────────────────────────────────
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
@@ -94,7 +135,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Camera discovery ─────────────────────────────────────────────
 
     def _discover_cameras(self) -> None:
-        """Scan for available cameras and populate panels."""
         self._status_bar.showMessage("Scanning for cameras...")
         QtCore.QTimer.singleShot(100, self._do_discover)
 
@@ -125,6 +165,82 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Ready — {len(self._cameras)} camera(s) found"
         )
 
+    # ── Sync control (soft-sync dual recording) ──────────────────────
+
+    def _start_both(self) -> None:
+        """Launch both cameras with a shared wall-clock reference."""
+        cfg1 = self._panel1.get_config()
+        cfg2 = self._panel2.get_config()
+
+        rec_a = self._panel1.create_recorder()
+        rec_b = self._panel2.create_recorder()
+
+        if rec_a is None or rec_b is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Cannot Start",
+                "Both cameras must be selected and configured before synced start.",
+            )
+            return
+
+        try:
+            self._sync.start_both(
+                rec_a, cfg1["resolution"], cfg1["fps"], cfg1["codec"],
+                rec_b, cfg2["resolution"], cfg2["fps"], cfg2["codec"],
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Sync Error", f"Failed to start synced recording:\n{exc}",
+            )
+            return
+
+        # Hand recorders back to panels so they own the stop lifecycle
+        self._panel1.set_recorder(rec_a)
+        self._panel2.set_recorder(rec_b)
+
+        # Update panel UIs
+        self._panel1._update_ui_recording_started(
+            rec_a._output_path.name, rec_a.camera_name,
+        )
+        self._panel2._update_ui_recording_started(
+            rec_b._output_path.name, rec_b.camera_name,
+        )
+
+        # Update sync buttons
+        self._start_both_btn.setEnabled(False)
+        self._stop_both_btn.setEnabled(True)
+        self._stop_both_btn.setStyleSheet(
+            "QPushButton { background: #c0392b; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #e74c3c; }"
+        )
+
+        self._status_bar.showMessage(
+            f"● Recording — shared time base | "
+            f"wall_start={self._sync.wall_start:.3f}"
+        )
+
+    def _stop_both(self) -> None:
+        """Stop all synced recordings."""
+        self._sync.stop_both()
+
+        # Notify panels to refresh UI
+        for panel in (self._panel1, self._panel2):
+            rec = panel._recorder  # type: ignore[union-attr]
+            if rec is not None and not rec.is_recording():
+                mp4 = rec.output_path.name if rec.output_path else "unknown"
+                srt = rec.srt_path.name if rec.srt_path else "unknown"
+                panel._update_ui_recording_stopped(mp4, srt)  # type: ignore[union-attr]
+
+        self._start_both_btn.setEnabled(True)
+        self._stop_both_btn.setEnabled(False)
+        self._stop_both_btn.setStyleSheet(
+            "QPushButton { background: #555; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #777; }"
+        )
+
+        self._status_bar.showMessage("Recording stopped — files saved")
+
     # ── About ────────────────────────────────────────────────────────
 
     def _show_about(self) -> None:
@@ -133,6 +249,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "<h3>MiceCam</h3>"
             "<p>Dual-camera video recorder with precise SRT timestamps.</p>"
             "<p>ffmpeg backend · H.264/H.265 · nanosecond SRT timestamps</p>"
+            "<p><b>Soft sync:</b> shared wall-clock reference for cross-camera "
+            "temporal alignment</p>"
             "<p><i>Built with PyQt6 + ffmpeg</i></p>",
         )
 
@@ -141,6 +259,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtCore.QEvent) -> None:
         """Ensure clean shutdown of all previews and recordings."""
         logger.info("Shutting down...")
+        if self._sync.is_recording:
+            self._sync.stop_both()
         if self._panel1:
             self._panel1.shutdown()
         if self._panel2:

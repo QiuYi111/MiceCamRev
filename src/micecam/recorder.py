@@ -58,9 +58,14 @@ class Recorder:
     # ── public API ────────────────────────────────────────────────────
 
     def start(self, resolution: tuple[int, int] = (1920, 1080),
-              fps: int = 30, codec: str = "h264") -> Path:
+              fps: int = 30, codec: str = "h264",
+              wall_start: float | None = None,
+              steady_start: int | None = None) -> Path:
         """
         Launch ffmpeg recording in a subprocess.
+
+        If *wall_start* / *steady_start* are provided (from a SyncController),
+        the SRT timestamps use a shared time base for cross-camera soft sync.
 
         Returns the path to the output MP4 file.
         """
@@ -80,9 +85,9 @@ class Recorder:
         self._output_path = cam_dir / f"{stem}.mp4"
         self._srt_path = cam_dir / f"{stem}.srt"
 
-        # Start timestamp writer (captures wall + steady clock refs)
+        # Start timestamp writer — uses shared clock refs if provided (soft sync)
         ts_writer = TimestampWriter(self._srt_path)
-        ts_writer.start()
+        ts_writer.start(wall_start=wall_start, steady_start=steady_start)
         self._ts_writer = ts_writer
 
         encoder = get_preferred_encoder(codec)
@@ -164,6 +169,16 @@ class Recorder:
 
     def is_recording(self) -> bool:
         return self._is_recording
+
+    @property
+    def output_path(self) -> Path | None:
+        """The MP4 output path, or None if recording hasn't started."""
+        return self._output_path
+
+    @property
+    def srt_path(self) -> Path | None:
+        """The SRT timestamp file path, or None if recording hasn't started."""
+        return self._srt_path
 
     # ── internals ─────────────────────────────────────────────────────
 

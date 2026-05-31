@@ -66,14 +66,26 @@ class TimestampWriter:
 
     # ── public API ────────────────────────────────────────────────────
 
-    def start(self) -> None:
+    def start(self, wall_start: float | None = None,
+              steady_start: int | None = None) -> None:
         """
         Capture the dual-clock reference point.
 
         Call once at the instant recording begins.
+
+        If *wall_start* / *steady_start* are provided (from a SyncController),
+        they are used as the shared reference instead of capturing new values.
+        This enables soft sync — two cameras share the same time base.
         """
-        self.wall_start = time.time()
-        self.steady_start = time.monotonic_ns()
+        if wall_start is not None:
+            self.wall_start = wall_start
+        else:
+            self.wall_start = time.time()
+
+        if steady_start is not None:
+            self.steady_start = steady_start
+        else:
+            self.steady_start = time.monotonic_ns()
         self._file = open(self._path, "w", encoding="utf-8")
 
         # Write header comment

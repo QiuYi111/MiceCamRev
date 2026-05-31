@@ -326,45 +326,89 @@ class CameraPanel(QtWidgets.QGroupBox):
         else:
             self._start_recording()
 
-    def _start_recording(self) -> None:
+    def create_recorder(self) -> Recorder | None:
+        """
+        Build a configured (but not started) Recorder from the current UI settings.
+
+        Returns None if no camera is selected or settings are invalid.
+        """
         if not self._current_camera:
-            return
+            return None
 
         res = self._res_combo.currentData()
         fps = self._fps_combo.currentData()
-        codec_label = self._codec_combo.currentText()
-        codec = "hevc" if "265" in codec_label or "HEVC" in codec_label else "h264"
-        output_dir = Path(self._output_edit.text())
-
         if not res or not fps:
-            QtWidgets.QMessageBox.warning(self, "Settings", "Select resolution and FPS first.")
-            return
+            return None
 
+        output_dir = Path(self._output_edit.text())
         cam = self._current_camera
-        self._recorder = Recorder(
+        return Recorder(
             camera_id=cam.platform_id,
             camera_name=cam.name,
             output_dir=output_dir,
         )
 
-        try:
-            output_path = self._recorder.start(
-                resolution=res, fps=fps, codec=codec,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start recording:\n{exc}")
-            return
+    def get_config(self) -> dict:
+        """Return the current UI settings as a dict (for SyncController use)."""
+        return {
+            "resolution": self._res_combo.currentData() or (1920, 1080),
+            "fps": self._fps_combo.currentData() or 30,
+            "codec": "hevc" if "265" in self._codec_combo.currentText() else "h264",
+        }
 
+    def set_recorder(self, recorder: Recorder) -> None:
+        """Accept an externally-created Recorder (e.g., from SyncController)."""
+        self._recorder = recorder
+
+    def _update_ui_recording_started(self, output_name: str, cam_name: str) -> None:
+        """Update UI state to reflect active recording."""
         self._record_btn.setText("■  Stop Recording")
         self._record_btn.setStyleSheet(
             "QPushButton { background: #555; color: white; font-weight: bold; "
             "border-radius: 4px; padding: 6px 16px; }"
             "QPushButton:hover { background: #777; }"
         )
-        self._status_label.setText(f"●  Recording → {output_path.name}")
+        self._status_label.setText(f"●  Recording → {output_name}")
         self._status_label.setStyleSheet("color: #e74c3c; font-size: 12px;")
-        self.setTitle(f"🔴 Camera {self.panel_id + 1} — {cam.name}")
-        self.recording_started.emit(cam.name)
+        self.setTitle(f"🔴 Camera {self.panel_id + 1} — {cam_name}")
+        self.recording_started.emit(cam_name)
+
+    def _update_ui_recording_stopped(self, mp4_name: str, srt_name: str) -> None:
+        """Update UI state to reflect stopped recording."""
+        self._record_btn.setText("●  Start Recording")
+        self._record_btn.setStyleSheet(
+            "QPushButton { background: #c0392b; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #e74c3c; }"
+        )
+        self._status_label.setText(f"✓  Saved: {mp4_name}  |  SRT: {srt_name}")
+        self._status_label.setStyleSheet("color: #27ae60; font-size: 12px;")
+        cam_name = self._current_camera.name if self._current_camera else ""
+        self.setTitle(f"Camera {self.panel_id + 1} — {cam_name}")
+        self.recording_stopped.emit(cam_name)
+
+    def _start_recording(self) -> None:
+        """Single-camera start (no sync). Uses independent clock references."""
+        if not self._current_camera:
+            return
+
+        cfg = self.get_config()
+        if not cfg["resolution"] or not cfg["fps"]:
+            QtWidgets.QMessageBox.warning(self, "Settings", "Select resolution and FPS first.")
+            return
+
+        self._recorder = self.create_recorder()
+        if self._recorder is None:
+            return
+
+        try:
+            output_path = self._recorder.start(**cfg)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start recording:\n{exc}")
+            return
+
+        cam_name = self._current_camera.name
+        self._update_ui_recording_started(output_path.name, cam_name)
 
     def _stop_recording(self) -> None:
         if not self._recorder:
@@ -376,20 +420,7 @@ class CameraPanel(QtWidgets.QGroupBox):
             logger.error("Error stopping recorder: %s", exc)
             return
 
-        self._record_btn.setText("●  Start Recording")
-        self._record_btn.setStyleSheet(
-            "QPushButton { background: #c0392b; color: white; font-weight: bold; "
-            "border-radius: 4px; padding: 6px 16px; }"
-            "QPushButton:hover { background: #e74c3c; }"
-        )
-        self._status_label.setText(
-            f"✓  Saved: {mp4_path.name}  |  SRT: {srt_path.name}"
-        )
-        self._status_label.setStyleSheet("color: #27ae60; font-size: 12px;")
-
-        cam_name = self._current_camera.name if self._current_camera else ""
-        self.setTitle(f"Camera {self.panel_id + 1} — {cam_name}")
-        self.recording_stopped.emit(cam_name)
+        self._update_ui_recording_stopped(mp4_path.name, srt_path.name)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
