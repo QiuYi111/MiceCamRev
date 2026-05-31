@@ -59,12 +59,23 @@ class EncoderInfo:
 
 def get_ffmpeg_path() -> str:
     """Return the path to ffmpeg, searching bundled location first."""
-    bundled = Path(__file__).parent.parent.parent / "ffmpeg" / "ffmpeg"
-    if platform.system() == "Windows":
-        bundled = bundled.with_suffix(".exe")
+    import sys as _sys
+
+    exe_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+
+    # 1. PyInstaller bundle: ffmpeg placed at MEIPASS root
+    if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
+        bundled = Path(_sys._MEIPASS) / exe_name
+        if bundled.exists():
+            return str(bundled)
+
+    # 2. Development: project /ffmpeg/ directory
+    bundled = Path(__file__).parent.parent.parent / "ffmpeg" / exe_name
     if bundled.exists():
         return str(bundled)
-    return "ffmpeg"
+
+    # 3. System PATH
+    return exe_name if platform.system() == "Windows" else "ffmpeg"
 
 
 def _run_ffmpeg(args: list[str], timeout: float = 10) -> str:
@@ -75,12 +86,15 @@ def _run_ffmpeg(args: list[str], timeout: float = 10) -> str:
             [ffmpeg, "-hide_banner"] + args,
             capture_output=True, text=True, timeout=timeout,
         )
-        return proc.stderr + proc.stdout
+        return (proc.stderr or "") + (proc.stdout or "")
     except FileNotFoundError:
         logger.error("ffmpeg not found at %s", ffmpeg)
         return ""
     except subprocess.TimeoutExpired:
         logger.warning("ffmpeg timed out: %s", args)
+        return ""
+    except Exception:
+        logger.exception("ffmpeg unexpected error: %s", args)
         return ""
 
 

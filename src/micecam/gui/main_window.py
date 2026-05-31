@@ -142,7 +142,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._cameras = list_cameras(probe_capabilities=True)
         except Exception as exc:
-            logger.error("Camera discovery failed: %s", exc)
+            logger.exception("Camera discovery failed")
             self._status_bar.showMessage(f"Camera discovery error: {exc}")
             return
 

@@ -289,12 +289,17 @@ class CameraPanel(QtWidgets.QGroupBox):
         for cam in cameras:
             self._cam_combo.addItem(f"[{cam.index}] {cam.name}", cam)
         # Restore selection
+        restored = False
         if current_id:
             for i in range(self._cam_combo.count()):
                 if self._cam_combo.itemData(i) is current_id:
                     self._cam_combo.setCurrentIndex(i)
+                    restored = True
                     break
         self._cam_combo.blockSignals(False)
+        # If no previous selection or it wasn't found, select first camera
+        if not restored and cameras:
+            self._on_camera_changed(0)
 
     # ── Preview ──────────────────────────────────────────────────────
 
