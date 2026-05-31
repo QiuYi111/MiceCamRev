@@ -13,11 +13,12 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
 
-# BtbN's ffmpeg-master-latest-win64-gpl-shared.zip — includes ffmpeg.exe
-# Using gpl-shared for smaller binary size; gpl includes libx264/libx265
+# BtbN's ffmpeg-master-latest-win64-gpl.zip — statically linked, no DLL deps.
+# "gpl" (not "gpl-shared"): all codecs linked into ffmpeg.exe, ~80 MB but
+# fully self-contained — no external DLLs needed at runtime.
 FFMPEG_URL = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-    "ffmpeg-master-latest-win64-gpl-shared.zip"
+    "ffmpeg-master-latest-win64-gpl.zip"
 )
 
 # Where to place the extracted ffmpeg.exe (project root /ffmpeg/)
