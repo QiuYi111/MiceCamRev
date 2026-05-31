@@ -318,6 +318,17 @@ class CameraPanel(QtWidgets.QGroupBox):
     def _on_preview_error(self, msg: str) -> None:
         self._preview_label.setText(f"Error: {msg}")
 
+    def _browse_output(self) -> None:
+        """Open a directory chooser dialog for the output folder."""
+        from PyQt6 import QtWidgets
+
+        current = self._output_edit.text()
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Output Directory", current,
+        )
+        if folder:
+            self._output_edit.setText(folder)
+
     # ── Recording ────────────────────────────────────────────────────
 
     def _toggle_recording(self) -> None:

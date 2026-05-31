@@ -25,8 +25,11 @@ jobs:
       - name: Sync dependencies
         run: uv sync --group dev
 
-      - name: Run tests
+      - name: Run unit tests
         run: uv run pytest tests/ -v
+
+      - name: Run smoke test (source)
+        run: uv run python -m micecam --check
 
       - name: Download ffmpeg for Windows
         shell: pwsh
@@ -44,6 +47,22 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: uv run pyinstaller micecam.spec
+
+      - name: Smoke test the EXE
+        shell: pwsh
+        run: |
+          Write-Host "=== EXE file info ==="
+          $exe = Get-Item dist/MiceCam.exe
+          Write-Host "Size: $([math]::Round($exe.Length / 1MB, 1)) MB"
+          Write-Host "=== Running EXE smoke test ==="
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath "dist/MiceCam.exe" -ArgumentList "--check" -NoNewWindow -Wait -PassThru
+          Write-Host "Exit code: $($proc.ExitCode)"
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "ERROR: EXE smoke test failed!"
+            exit 1
+          }
+          Write-Host "EXE smoke test PASSED"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
