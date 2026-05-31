@@ -17,7 +17,8 @@ block_cipher = None
 # ── Determine ffmpeg binary to bundle ───────────────────────────────────
 _IS_WIN = sys.platform == "win32"
 _FFMPEG_NAME = "ffmpeg.exe" if _IS_WIN else "ffmpeg"
-_PROJECT_ROOT = Path(__file__).parent
+# SPECPATH is provided by PyInstaller at spec execution time
+_PROJECT_ROOT = Path(SPECPATH)
 
 # Look for bundled ffmpeg (put there by scripts/download_ffmpeg.py)
 _bundled_ffmpeg = _PROJECT_ROOT / "ffmpeg" / _FFMPEG_NAME
