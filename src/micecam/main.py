@@ -15,10 +15,10 @@ def _run_smoke_test() -> int:
     errors: list[str] = []
 
     def check(desc: str, ok: bool, detail: str = "") -> None:
-        status = "✓" if ok else "✗"
-        line = f"  {status} {desc}"
+        status = "OK" if ok else "FAIL"
+        line = f"  [{status}] {desc}"
         if not ok:
-            line += f"  [{detail}]"
+            line += f"  -- {detail}"
             errors.append(f"{desc}: {detail}")
         print(line)
 
@@ -102,14 +102,13 @@ def _run_smoke_test() -> int:
     except Exception as e:
         check("SyncController init", False, str(e))
 
-    # 5. Camera enumeration (without probing — fast path)
+    # 5. Camera enumeration (without probing -- fast path)
     print("\n5. Camera enumeration (fast, no probing)")
     try:
         cameras = list_cameras(probe_capabilities=False)
-        check(f"list_cameras → {len(cameras)} found", len(cameras) >= 0)
-        if cameras:
-            for cam in cameras:
-                print(f"     [{cam.index}] {cam.name}")
+        check(f"list_cameras -> {len(cameras)} found", len(cameras) >= 0)
+        for cam in cameras:
+            print(f"     [{cam.index}] {cam.name}")
     except Exception as e:
         check("list_cameras", False, str(e))
 
@@ -133,7 +132,7 @@ def _run_smoke_test() -> int:
     except Exception as e:
         check("ffmpeg path", False, str(e))
 
-    # 8. GUI imports (no window creation — just verify PyQt works)
+    # 8. GUI imports (no window creation -- just verify PyQt works)
     print("\n8. GUI imports")
     try:
         from PyQt6 import QtWidgets, QtCore, QtGui
@@ -151,9 +150,9 @@ def _run_smoke_test() -> int:
 
     print(f"\n{'='*30}")
     if errors:
-        print(f"FAILED — {len(errors)} check(s) failed:")
+        print(f"FAILED -- {len(errors)} check(s) failed:")
         for e in errors:
-            print(f"  ✗ {e}")
+            print(f"  FAIL: {e}")
         return 1
     print("ALL CHECKS PASSED")
     return 0
