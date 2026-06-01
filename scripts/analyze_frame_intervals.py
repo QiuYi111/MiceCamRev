@@ -497,25 +497,70 @@ window.addEventListener('resize', () => {
 """
 
 
+# ── Auto-discovery ──────────────────────────────────────────────────────────
+
+def _find_latest_recordings(
+    directory: Path, count: int = 1,
+) -> list[tuple[Path, Optional[Path]]]:
+    """Find the most recent .srt files (with paired .mp4 if present).
+
+    Returns list of (srt_path, mp4_path_or_None), newest first.
+    Skips .srt files that are header-only (<= 200 bytes).
+    """
+    pairs: list[tuple[Path, Optional[Path], float]] = []  # (srt, mp4, mtime)
+
+    for srt in sorted(directory.glob("*.srt"), key=lambda p: -p.stat().st_mtime):
+        if srt.stat().st_size <= 200:
+            continue  # header-only stub
+        stem = srt.stem
+        mp4 = directory / f"{stem}.mp4"
+        pairs.append((srt, mp4 if mp4.exists() else None, srt.stat().st_mtime))
+
+    # Return newest first
+    pairs.sort(key=lambda x: -x[2])
+    return [(srt, mp4) for srt, mp4, _ in pairs[:count]]
+
+
+def _infer_target_fps_from_srt(srt_path: Path) -> Optional[int]:
+    """Try to infer target FPS from the SRT file's comment header."""
+    text = srt_path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line.startswith("# target_fps:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze MiceCam SRT frame intervals",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog="""Examples:
+  %(prog)s                          # auto-detect latest recording in cwd
+  %(prog)s output/HD_USB_Camera/    # auto-detect latest in directory
+  %(prog)s rec.srt --mp4 rec.mp4    # explicit files
+  %(prog)s cam_a.srt cam_b.srt      # compare two recordings
+  %(prog)s --last 3                 # compare last 3 recordings""",
     )
     parser.add_argument(
-        "srt_files", nargs="+", type=Path,
-        help="One or two .srt files to analyze",
+        "paths", nargs="*", type=Path,
+        help=".srt file(s), a directory to scan, or nothing (auto-detect in cwd)",
     )
     parser.add_argument(
         "--fps", type=int, default=None,
-        help="Target recording FPS (for gap threshold; auto-detected if omitted)",
+        help="Target recording FPS (auto-detected from SRT header or data if omitted)",
     )
     parser.add_argument(
         "--mp4", type=Path, default=None,
-        help="Corresponding .mp4 file for ffprobe metadata",
+        help="Corresponding .mp4 file (only with a single explicit .srt)",
+    )
+    parser.add_argument(
+        "--last", type=int, default=None, metavar="N",
+        help="Compare the N most recent recordings (default: 1)",
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
@@ -523,42 +568,120 @@ def main():
     )
     args = parser.parse_args()
 
-    if len(args.srt_files) > 2:
-        print("Error: at most 2 SRT files supported for comparison", file=sys.stderr)
+    # ── Resolve input files ──
+    srt_files: list[Path] = []
+    mp4_file: Optional[Path] = args.mp4
+
+    if not args.paths:
+        # No args: auto-detect latest in cwd
+        cwd = Path.cwd()
+        print(f"Auto-detecting latest recording in: {cwd}")
+        pairs = _find_latest_recordings(cwd, count=args.last or 1)
+        if not pairs:
+            # Try the default output directory
+            default = cwd / "output"
+            if default.exists():
+                # Recurse into date subdirs
+                for subdir in sorted(default.rglob("*.srt"), key=lambda p: -p.stat().st_mtime):
+                    parent = subdir.parent
+                    print(f"Auto-detecting in: {parent}")
+                    pairs = _find_latest_recordings(parent, count=args.last or 1)
+                    if pairs:
+                        break
+        if not pairs:
+            print("Error: no .srt files found in current directory or output/",
+                  file=sys.stderr)
+            sys.exit(1)
+        for srt, mp4 in pairs:
+            srt_files.append(srt)
+            if mp4 and mp4_file is None:
+                mp4_file = mp4
+
+    elif len(args.paths) == 1 and args.paths[0].is_dir():
+        # Directory: auto-detect latest
+        directory = args.paths[0]
+        print(f"Auto-detecting latest recording in: {directory}")
+        pairs = _find_latest_recordings(directory, count=args.last or 1)
+        if not pairs:
+            print(f"Error: no .srt files found in {directory}", file=sys.stderr)
+            sys.exit(1)
+        for srt, mp4 in pairs:
+            srt_files.append(srt)
+            if mp4 and mp4_file is None:
+                mp4_file = mp4
+
+    else:
+        # Explicit files
+        for p in args.paths:
+            if p.is_dir():
+                print(f"Warning: skipping directory {p} (use without other args to scan)",
+                      file=sys.stderr)
+                continue
+            if p.suffix.lower() == ".mp4":
+                if mp4_file is None:
+                    mp4_file = p
+                continue
+            srt_files.append(p)
+
+    if not srt_files:
+        print("Error: no .srt files specified or found", file=sys.stderr)
         sys.exit(1)
 
+    if len(srt_files) > 5:
+        print(f"Limiting to newest 5 of {len(srt_files)} found", file=sys.stderr)
+        srt_files = srt_files[:5]
+
+    # ── Analyze ──
     results = []
     labels = []
-    for p in args.srt_files:
+    for p in srt_files:
         if not p.exists():
-            print(f"Error: file not found: {p}", file=sys.stderr)
-            sys.exit(1)
+            print(f"Warning: file not found: {p}", file=sys.stderr)
+            continue
         wall_times, _wall_start, _steady = parse_srt(p)
-        print(f"Parsed {p.name}: {len(wall_times)} frames")
-        r = analyze(wall_times, target_fps=args.fps)
+        print(f"Parsed {p.name}: {len(wall_times)} frames", end="")
+
+        # Auto-infer target FPS
+        fps = args.fps
+        if fps is None:
+            fps = _infer_target_fps_from_srt(p)
+        if fps is None and wall_times and len(wall_times) >= 2:
+            # Fallback: round actual median FPS to nearest common value
+            intervals = [wall_times[i] - wall_times[i - 1] for i in range(1, len(wall_times))]
+            median_fps = 1.0 / statistics.median(intervals) if intervals else 0
+            for candidate in [120, 60, 50, 30, 25, 24, 15, 10]:
+                if abs(median_fps - candidate) < candidate * 0.25:
+                    fps = candidate
+                    break
+            if fps is None:
+                fps = round(median_fps)
+        print(f"  (target: {fps} fps)")
+
+        r = analyze(wall_times, target_fps=fps)
         results.append(r)
         labels.append(p.name)
 
+    # ── MP4 probe ──
     mp4_info = None
-    if args.mp4:
-        if args.mp4.exists():
-            print(f"Probing {args.mp4.name} with ffprobe...")
-            mp4_info = probe_mp4(args.mp4)
+    if mp4_file:
+        if mp4_file.exists():
+            print(f"Probing {mp4_file.name}...")
+            mp4_info = probe_mp4(mp4_file)
             if mp4_info:
                 print(f"  Container: {mp4_info.get('codec','?')} "
                       f"{mp4_info.get('resolution','?')} "
                       f"{mp4_info.get('container_fps','?')}fps "
                       f"{mp4_info.get('duration_s','?')}s")
             else:
-                print("  (ffprobe failed or returned no data)")
+                print("  (no data)")
         else:
-            print(f"Warning: MP4 not found: {args.mp4}")
+            print(f"Warning: MP4 not found: {mp4_file}")
 
+    # ── Output ──
     output_path = args.output or Path("frame_analysis_report.html")
     report_path = generate_html(results, labels, mp4_info, output_path)
     print(f"\nReport: {report_path.resolve()}")
 
-    # Open in browser
     webbrowser.open(str(report_path.resolve()))
     print("Opened in browser.")
 
