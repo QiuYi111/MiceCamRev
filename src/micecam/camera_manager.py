@@ -192,14 +192,14 @@ def _list_devices_windows() -> list[CameraInfo]:
         if match:
             name = match.group(1)
             idx = len(cameras)
-            # NOTE: no shell quotes — subprocess passes each list element
-            # as a single argv entry, so ``video=Integrated Camera`` is
-            # already one argument.  Literal ``"`` chars would be passed
-            # to ffmpeg and treated as part of the device name, causing
-            # "Could not find video device with name ["Camera"]".
+            # Escape AVOption separators so ffmpeg doesn't misinterpret
+            # a device name containing ':' or '\' as option injection.
+            # (Shell quotes don't work here — subprocess list mode passes
+            # literal " chars to ffmpeg, which then fails to find the device.)
+            escaped = name.replace("\\", "\\\\").replace(":", "\\:")
             cameras.append(CameraInfo(
                 index=idx, name=name,
-                platform_id=f'video={name}',
+                platform_id=f'video={escaped}',
             ))
 
     logger.info("Found %d dshow camera(s)", len(cameras))
