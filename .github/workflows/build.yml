@@ -25,12 +25,6 @@ jobs:
       - name: Sync dependencies
         run: uv sync --group dev
 
-      - name: Run unit tests
-        run: uv run pytest tests/ -v
-
-      - name: Run smoke test (source)
-        run: uv run python -m micecam --check
-
       - name: Download ffmpeg for Windows
         shell: pwsh
         run: |
@@ -43,7 +37,13 @@ jobs:
           Write-Host "Found: $ffmpeg"
           New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
           Copy-Item "ffmpeg_extracted/$ffmpeg" -Destination ffmpeg/ffmpeg.exe
-          Write-Host "ffmpeg.exe copied"
+          Write-Host "ffmpeg.exe -> ffmpeg/ffmpeg.exe"
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -v
+
+      - name: Run smoke test (source)
+        run: uv run python -m micecam --check
 
       - name: Build EXE with PyInstaller
         run: uv run pyinstaller micecam.spec
