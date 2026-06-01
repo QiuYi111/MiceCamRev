@@ -167,3 +167,24 @@ frame=  495 fps=0.0 q=-1.0 Lsize=N/A time=00:00:16.59 bitrate=N/A speed= 341x
         assert cmd[number_index + 1] == "1"
         assert number_index < input_index
         assert cmd[input_index + 1] == "video=Twin Camera"
+
+    def test_validate_output_rejects_missing_mp4(self, tmp_path: Path) -> None:
+        recorder = Recorder(camera_id="video=Test", output_dir=tmp_path)
+        recorder._output_path = tmp_path / "missing.mp4"
+        recorder.frame_count = 10
+
+        error = recorder._validate_output_video(video_frames=None, return_code=0)
+
+        assert error is not None
+        assert "MP4 output was not created" in error
+
+    def test_validate_output_rejects_zero_frames(self, tmp_path: Path) -> None:
+        video_path = tmp_path / "empty.mp4"
+        video_path.write_bytes(b"not empty but no frames")
+        recorder = Recorder(camera_id="video=Test", output_dir=tmp_path)
+        recorder._output_path = video_path
+        recorder.frame_count = 0
+
+        error = recorder._validate_output_video(video_frames=None, return_code=0)
+
+        assert error == "ffmpeg reported zero recorded frames"

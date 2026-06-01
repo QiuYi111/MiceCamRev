@@ -229,15 +229,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_both(self) -> None:
         """Stop all synced recordings."""
-        self._sync.stop_both()
+        stop_error: Exception | None = None
+        try:
+            self._sync.stop_both()
+        except Exception as exc:
+            stop_error = exc
 
         # Notify panels to refresh UI
         for panel in (self._panel1, self._panel2):
             rec = panel._recorder  # type: ignore[union-attr]
             if rec is not None and not rec.is_recording():
-                mp4 = rec.output_path.name if rec.output_path else "unknown"
-                srt = rec.srt_path.name if rec.srt_path else "unknown"
-                panel._update_ui_recording_stopped(mp4, srt)  # type: ignore[union-attr]
+                if rec.last_error:
+                    panel._update_ui_recording_failed(rec.last_error)  # type: ignore[union-attr]
+                else:
+                    mp4 = rec.output_path.name if rec.output_path else "unknown"
+                    srt = rec.srt_path.name if rec.srt_path else "unknown"
+                    panel._update_ui_recording_stopped(mp4, srt)  # type: ignore[union-attr]
 
         self._start_both_btn.setEnabled(True)
         self._stop_both_btn.setEnabled(False)
@@ -247,7 +254,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "QPushButton:hover { background: #777; }"
         )
 
-        self._status_bar.showMessage("Recording stopped — files saved")
+        if stop_error:
+            self._status_bar.showMessage(f"Recording stopped with errors: {stop_error}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Recording Error",
+                f"One or more recordings failed:\n{stop_error}",
+            )
+        else:
+            self._status_bar.showMessage("Recording stopped — files saved")
 
         # Restart previews now that recording has finished
         self._panel1._start_preview(self._panel1._current_camera)

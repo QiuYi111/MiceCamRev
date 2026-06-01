@@ -28,8 +28,9 @@ from micecam.recorder import Recorder
 logger = logging.getLogger(__name__)
 
 # Preview dimensions (kept low to avoid taxing the camera / USB bus)
-PREVIEW_W = 640
-PREVIEW_H = 480
+PREVIEW_MAX_W = 640
+PREVIEW_MAX_H = 480
+PREVIEW_PREFERRED_FPS = 15
 
 
 # ── Preview capture thread ──────────────────────────────────────────
@@ -46,11 +47,15 @@ class PreviewThread(QtCore.QThread):
     preview_error = QtCore.pyqtSignal(str)
 
     def __init__(self, camera_id: str, fps: int = 30,
+                 resolution: tuple[int, int] = (PREVIEW_MAX_W, PREVIEW_MAX_H),
+                 native_codec: str = "",
                  device_number: int | None = None,
                  parent: Optional[QtCore.QObject] = None):
         super().__init__(parent)
         self.camera_id = camera_id
         self.fps = fps
+        self.resolution = resolution
+        self.native_codec = native_codec
         self.device_number = device_number
         self._running = False
         self._process: Optional[subprocess.Popen] = None
@@ -59,12 +64,13 @@ class PreviewThread(QtCore.QThread):
         self._running = True
         ffmpeg = get_ffmpeg_path()
         system = sys.platform
+        preview_w, preview_h = self.resolution
 
         if system == "darwin":
             input_args = [
                 "-f", "avfoundation",
                 "-framerate", str(self.fps),
-                "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
+                "-video_size", f"{preview_w}x{preview_h}",
                 "-i", self.camera_id,
             ]
         elif system == "win32":
@@ -76,15 +82,19 @@ class PreviewThread(QtCore.QThread):
                     ["-video_device_number", str(self.device_number)]
                     if self.device_number is not None else []
                 ),
+                *(
+                    ["-vcodec", self.native_codec]
+                    if self.native_codec in {"mjpeg", "h264", "hevc"} else []
+                ),
                 "-framerate", str(self.fps),
-                "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
+                "-video_size", f"{preview_w}x{preview_h}",
                 "-i", self.camera_id,
             ]
         else:
             input_args = [
                 "-f", "v4l2",
                 "-framerate", str(self.fps),
-                "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
+                "-video_size", f"{preview_w}x{preview_h}",
                 "-i", self.camera_id,
             ]
 
@@ -109,7 +119,7 @@ class PreviewThread(QtCore.QThread):
             self.preview_error.emit("ffmpeg not found")
             return
 
-        frame_size = PREVIEW_W * PREVIEW_H * 3  # RGB24 = 3 bytes/pixel
+        frame_size = preview_w * preview_h * 3  # RGB24 = 3 bytes/pixel
         first_frame = True
         stdout = self._process.stdout
         while self._running and self._process.poll() is None:
@@ -126,7 +136,7 @@ class PreviewThread(QtCore.QThread):
 
             # Build QImage from raw RGB24 data
             image = QtGui.QImage(
-                raw, PREVIEW_W, PREVIEW_H, PREVIEW_W * 3,
+                raw, preview_w, preview_h, preview_w * 3,
                 QtGui.QImage.Format.Format_RGB888,
             )
             if not image.isNull():
@@ -236,7 +246,7 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         # --- Preview ---
         self._preview_label = QtWidgets.QLabel()
-        self._preview_label.setFixedSize(PREVIEW_W, PREVIEW_H)
+        self._preview_label.setFixedSize(PREVIEW_MAX_W, PREVIEW_MAX_H)
         self._preview_label.setStyleSheet(
             "QLabel { background: #1a1a1a; border: 1px solid #444; "
             "color: #666; font-size: 14px; }"
@@ -314,7 +324,9 @@ class CameraPanel(QtWidgets.QGroupBox):
         for cam in self._cameras:
             self._cam_combo.addItem(f"[{cam.index}] {cam.name}", cam)
         if self._cameras:
-            self._on_camera_changed(0)
+            default_index = min(self.panel_id, len(self._cameras) - 1)
+            self._cam_combo.setCurrentIndex(default_index)
+            self._on_camera_changed(default_index)
 
     def _on_camera_changed(self, index: int) -> None:
         if index < 0 or index >= len(self._cameras):
@@ -469,24 +481,24 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._cam_combo.blockSignals(False)
         # If no previous selection or it wasn't found, select first camera
         if not restored and cameras:
-            self._on_camera_changed(0)
+            default_index = min(self.panel_id, len(cameras) - 1)
+            self._cam_combo.setCurrentIndex(default_index)
+            self._on_camera_changed(default_index)
 
     # ── Preview ──────────────────────────────────────────────────────
 
     def _start_preview(self, cam: CameraInfo) -> None:
         self._stop_preview()
-        # Preview always runs at a moderate framerate — high FPS (e.g. 120)
-        # is rarely supported at 640×480 and would cause ffmpeg to fail.
-        # Pick the closest fps ≤ 30 from the camera's supported list.
-        supported = cam.supported_framerates or [30]
-        preview_fps = 30
-        for f in supported:
-            if f <= 30 and (30 - f) < (30 - preview_fps):
-                preview_fps = f
-        logger.debug("Preview using %d fps (supported: %s)", preview_fps, supported)
+        preview_res, preview_fps = self._choose_preview_mode(cam)
+        logger.debug(
+            "Preview using %dx%d @ %d fps for %s (native=%s)",
+            preview_res[0], preview_res[1], preview_fps, cam.name, cam.native_codec,
+        )
         self._preview_thread = PreviewThread(
             cam.platform_id,
             fps=preview_fps,
+            resolution=preview_res,
+            native_codec=cam.native_codec,
             device_number=cam.device_number,
             parent=self,
         )
@@ -494,6 +506,32 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._preview_thread.preview_error.connect(self._on_preview_error)
         self._preview_thread.start()
         self._preview_label.setText("Connecting...")
+
+    def _choose_preview_mode(self, cam: CameraInfo) -> tuple[tuple[int, int], int]:
+        """
+        Pick a low-bandwidth preview mode from the camera capabilities.
+
+        Prefer a small resolution and <=15 fps so the preview does not consume
+        the same scarce DirectShow/USB resources as the recording stream.
+        """
+        resolutions = cam.supported_resolutions or [(PREVIEW_MAX_W, PREVIEW_MAX_H)]
+        candidates = [
+            res for res in resolutions
+            if res[0] <= PREVIEW_MAX_W and res[1] <= PREVIEW_MAX_H
+        ] or resolutions
+        preview_res = min(candidates, key=lambda res: (res[0] * res[1], res[0], res[1]))
+
+        fps_values = (
+            cam.resolution_fps.get(preview_res)
+            if cam.resolution_fps and preview_res in cam.resolution_fps
+            else cam.supported_framerates
+        ) or [PREVIEW_PREFERRED_FPS]
+        low_fps = [fps for fps in fps_values if fps <= PREVIEW_PREFERRED_FPS]
+        if low_fps:
+            preview_fps = max(low_fps)
+        else:
+            preview_fps = min(fps_values)
+        return preview_res, preview_fps
 
     def _stop_preview(self) -> None:
         if self._preview_thread is not None:
@@ -589,6 +627,19 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.setTitle(f"Camera {self.panel_id + 1} — {cam_name}")
         self.recording_stopped.emit(cam_name)
 
+    def _update_ui_recording_failed(self, message: str) -> None:
+        """Update UI state when ffmpeg failed after recording was started."""
+        self._record_btn.setText("●  Start Recording")
+        self._record_btn.setStyleSheet(
+            "QPushButton { background: #c0392b; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 6px 16px; }"
+            "QPushButton:hover { background: #e74c3c; }"
+        )
+        self._status_label.setText(f"Recording failed: {message[:180]}")
+        self._status_label.setStyleSheet("color: #e74c3c; font-size: 12px;")
+        cam_name = self._current_camera.name if self._current_camera else ""
+        self.setTitle(f"Camera {self.panel_id + 1} — {cam_name}")
+
     def _start_recording(self) -> None:
         """Single-camera start (no sync). Uses independent clock references."""
         if not self._current_camera:
@@ -628,6 +679,9 @@ class CameraPanel(QtWidgets.QGroupBox):
             mp4_path, srt_path = self._recorder.stop()
         except Exception as exc:
             logger.error("Error stopping recorder: %s", exc)
+            self._update_ui_recording_failed(str(exc))
+            if self._current_camera:
+                self._start_preview(self._current_camera)
             return
 
         self._update_ui_recording_stopped(mp4_path.name, srt_path.name)

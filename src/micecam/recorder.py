@@ -59,7 +59,11 @@ class Recorder:
         self._output_path: Optional[Path] = None
         self._srt_path: Optional[Path] = None
         self._metadata_path: Optional[Path] = None
+        self._ffmpeg_log_path: Optional[Path] = None
         self._is_recording = False
+        self._failure_reason: str | None = None
+        self._stderr_tail: list[str] = []
+        self._stderr_error_lines: list[str] = []
 
         # Progress tracking
         self.duration_seconds: float = 0.0
@@ -100,10 +104,14 @@ class Recorder:
         self._output_path = cam_dir / f"{stem}.mp4"
         self._srt_path = cam_dir / f"{stem}.srt"
         self._metadata_path = cam_dir / f"{stem}.json"
+        self._ffmpeg_log_path = cam_dir / f"{stem}.ffmpeg.log"
         self._requested_resolution = resolution
         self._requested_fps = fps
         self._requested_codec = codec
         self._frame_wall_times = []
+        self._failure_reason = None
+        self._stderr_tail = []
+        self._stderr_error_lines = []
 
         # Start timestamp writer — uses shared clock refs if provided (soft sync)
         ts_writer = TimestampWriter(self._srt_path)
@@ -157,6 +165,7 @@ class Recorder:
                 self._is_recording = False
                 # Drain remaining stderr so _read_stderr logs the errors
                 self._reader_thread.join(timeout=2)
+                self._mark_failed(f"ffmpeg exited during startup with code {rc}")
                 # Clean up empty output file if ffmpeg created one
                 if self._output_path and self._output_path.exists():
                     try:
@@ -201,10 +210,11 @@ class Recorder:
                             path.unlink()
                         except OSError:
                             pass
+                self._mark_failed(f"ffmpeg exited during startup with code {rc}")
                 raise RuntimeError(
                     f"ffmpeg exited with code {rc} - camera may be busy, "
                     f"or the resolution/FPS combination is unsupported. "
-                    f"Check the log for details."
+                    f"{self._failure_hint()}"
                 )
 
     def stop(self) -> tuple[Path, Path]:
@@ -233,6 +243,7 @@ class Recorder:
         except subprocess.TimeoutExpired:
             logger.warning("ffmpeg didn't exit gracefully, sending SIGTERM")
             self._kill_process()
+        return_code = self._process.returncode
 
         self._is_recording = False
         if hasattr(self, "_reader_thread"):
@@ -250,6 +261,10 @@ class Recorder:
             self.duration_seconds = wall_duration
             if video_frames is not None:
                 self.frame_count = video_frames
+
+        validation_error = self._validate_output_video(video_frames, return_code)
+        if validation_error:
+            self._mark_failed(validation_error)
 
         logger.info(
             "Recording timing [%s]: video=%.3fs/%d frames, wall=%.3fs",
@@ -271,6 +286,10 @@ class Recorder:
         )
 
         # Verify output
+        if validation_error:
+            logger.error("Recording failed for %s: %s", self.camera_name, validation_error)
+            raise RuntimeError(f"{validation_error}. {self._failure_hint()}")
+
         if self._output_path and self._output_path.exists():
             size_mb = self._output_path.stat().st_size / (1024 * 1024)
             logger.info("Recording saved: %s (%.1f MB, %.1f s)",
@@ -297,6 +316,16 @@ class Recorder:
     def metadata_path(self) -> Path | None:
         """The JSON metadata path, or None if recording hasn't started."""
         return self._metadata_path
+
+    @property
+    def ffmpeg_log_path(self) -> Path | None:
+        """The per-recording ffmpeg stderr log path, when available."""
+        return self._ffmpeg_log_path
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent recording failure, if this recorder failed."""
+        return self._failure_reason
 
     # ── internals ─────────────────────────────────────────────────────
 
@@ -406,11 +435,24 @@ class Recorder:
         """
         if self._process is None or self._process.stderr is None:
             return
+        log_file = None
+        if self._ffmpeg_log_path is not None:
+            try:
+                log_file = self._ffmpeg_log_path.open("w", encoding="utf-8", errors="replace")
+            except OSError:
+                logger.exception("Could not open ffmpeg log: %s", self._ffmpeg_log_path)
+
         error_lines: list[str] = []
         for line in self._process.stderr:
             line = line.strip()
             if not line:
                 continue
+            if log_file is not None:
+                try:
+                    log_file.write(line + "\n")
+                except OSError:
+                    log_file = None
+            self._remember_stderr_line(line)
             # Detect error-level messages
             lower = line.lower()
             if any(kw in lower for kw in (
@@ -418,6 +460,8 @@ class Recorder:
                 "no such", "unable", "i/o error", "permission",
             )):
                 error_lines.append(line)
+                self._stderr_error_lines.append(line)
+                self._stderr_error_lines = self._stderr_error_lines[-20:]
                 logger.error("ffmpeg [%s]: %s", self.camera_name, line)
             elif "demuxer ->" in line and "pkt_pts_time:" in line:
                 self._record_frame_timestamp(line)
@@ -442,6 +486,49 @@ class Recorder:
                 "Errors: %s",
                 self.camera_name, "; ".join(error_lines[-5:]),
             )
+            self._mark_failed("ffmpeg exited with errors and 0 frames")
+        if log_file is not None:
+            try:
+                log_file.close()
+            except OSError:
+                pass
+
+    def _remember_stderr_line(self, line: str) -> None:
+        """Keep a small stderr tail for UI/error messages without storing debug_ts."""
+        if "demuxer ->" in line:
+            return
+        self._stderr_tail.append(line)
+        self._stderr_tail = self._stderr_tail[-20:]
+
+    def _mark_failed(self, reason: str) -> None:
+        if self._failure_reason is None:
+            self._failure_reason = reason
+
+    def _failure_hint(self) -> str:
+        details = self._stderr_error_lines[-3:] or self._stderr_tail[-3:]
+        suffix = f" Last ffmpeg messages: {' | '.join(details)}" if details else ""
+        log = f" ffmpeg log: {self._ffmpeg_log_path}" if self._ffmpeg_log_path else ""
+        return f"Check the log for details.{suffix}{log}"
+
+    def _validate_output_video(
+        self,
+        video_frames: int | None,
+        return_code: int | None,
+    ) -> str | None:
+        """Return a failure reason when the MP4 is missing or not usable."""
+        if return_code not in (0, None):
+            return f"ffmpeg exited with code {return_code}"
+        if self._output_path is None:
+            return "output path was not initialized"
+        if not self._output_path.exists():
+            return f"MP4 output was not created: {self._output_path}"
+        if self._output_path.stat().st_size <= 0:
+            return f"MP4 output is empty: {self._output_path}"
+        if video_frames is not None and video_frames <= 0:
+            return f"MP4 contains no video frames: {self._output_path}"
+        if self.frame_count <= 0:
+            return "ffmpeg reported zero recorded frames"
+        return None
 
     def _kill_process(self) -> None:
         """Force-kill the ffmpeg process."""
@@ -615,6 +702,9 @@ class Recorder:
                 "mean_fps": container_fps,
             },
             "diagnostics": {
+                "status": "failed" if self._failure_reason else "ok",
+                "failure_reason": self._failure_reason,
+                "ffmpeg_log": str(self._ffmpeg_log_path) if self._ffmpeg_log_path else None,
                 "duration_delta_seconds": duration_delta,
                 "warnings": warnings,
             },

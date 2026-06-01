@@ -115,14 +115,19 @@ class SyncController:
 
     def stop_both(self) -> None:
         """Stop all managed recorders."""
+        errors: list[str] = []
         for rec in self._recorders:
             if rec.is_recording():
                 try:
                     rec.stop()
-                except Exception:
+                except Exception as exc:
+                    msg = f"{rec.camera_name}: {exc}"
+                    errors.append(msg)
                     logger.exception("Error stopping recorder %s", rec.camera_name)
         self._recorders.clear()
         logger.info("All recorders stopped")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     @property
     def is_recording(self) -> bool:

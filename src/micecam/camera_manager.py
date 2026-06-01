@@ -8,6 +8,7 @@ doesn't provide direct enumeration.
 
 from __future__ import annotations
 
+import json
 import logging
 import platform
 import re
@@ -37,6 +38,7 @@ ENCODER_PRIORITY: dict[str, list[str]] = {
     "Linux": ["h264_vaapi", "hevc_vaapi"],
 }
 FALLBACK_ENCODERS = ["libx264", "libx265"]
+DSHOW_CAPTURE_GUID = "65e8773d-8f56-11d0-a3b9-00a0c9223196"
 
 
 @dataclass
@@ -154,54 +156,65 @@ def _list_devices_windows() -> list[CameraInfo]:
     2. ffmpeg <7 requires the *format-specific* position (after ``-f dshow``)
 
     **Duplicate-camera disambiguation:** When two cameras share the same
-    friendly name (e.g. two identical USB cameras), the "Alternative name"
-    line from ffmpeg 8+ provides a unique DirectShow device path that
-    reliably identifies each physical device.  We use it as the
-    ``platform_id`` so ffmpeg can distinguish them.  On older ffmpeg
-    builds that lack alternative-name output we keep the friendly-name
-    ``platform_id`` and set ``device_number`` so ffmpeg can disambiguate
-    via ``-video_device_number``.
+    friendly name (e.g. two identical USB cameras), prefer a stable
+    ``@device_pnp_...`` DirectShow moniker over the fragile friendly-name
+    ordinal.  The moniker can come from ffmpeg's "Alternative name" output
+    or from Windows PnP/DeviceClasses.  ``-video_device_number`` is kept
+    only as the last fallback for old/incomplete systems.
     """
-    # ffmpeg 7+: generic option before -f
-    output = _run_ffmpeg(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+    cameras: list[CameraInfo] = []
+    for args in (
+        ["-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        ["-f", "dshow", "-list_devices", "true", "-i", "dummy"],
+    ):
+        candidate = _run_ffmpeg(args)
+        logger.debug("dshow device listing output:\n%s", candidate)
+        cameras = _parse_dshow_device_list(candidate)
+        if cameras:
+            break
 
-    # Fallback for older ffmpeg: format-specific option after -f dshow
-    if not output.strip():
-        logger.debug("generic -list_devices returned empty, trying format-specific")
-        output = _run_ffmpeg(["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
-
-    if not output.strip():
-        logger.warning("ffmpeg -list_devices returned empty output "
-                       "(both argument orders tried)")
+    if not cameras:
+        pnp_cameras = _list_devices_windows_pnp()
+        if pnp_cameras:
+            _suffix_duplicate_camera_names(pnp_cameras)
+            logger.info("Found %d dshow camera(s) via PnP", len(pnp_cameras))
+            for c in pnp_cameras:
+                logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+            return pnp_cameras
+        logger.warning("No Windows camera devices found")
         return []
 
-    logger.debug("dshow device listing output:\n%s", output)
+    if _needs_pnp_stable_ids(cameras):
+        cameras = _apply_pnp_stable_ids(cameras, _list_devices_windows_pnp())
 
+    # Keep UI/output labels unique without changing the DirectShow ID.
+    _suffix_duplicate_camera_names(cameras)
+
+    logger.info("Found %d dshow camera(s)", len(cameras))
+    for c in cameras:
+        logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+    return cameras
+
+
+def _parse_dshow_device_list(output: str) -> list[CameraInfo]:
+    """Parse ffmpeg dshow -list_devices output without side effects."""
     cameras: list[CameraInfo] = []
     has_section_headers = "DirectShow video devices" in output
-    in_video_section = not has_section_headers  # if no headers, parse all lines
-
-    # Track the most recently seen *video* camera so we can associate
-    # the following "Alternative name" line with it.  Clear on audio
-    # devices to avoid cross-wiring their alternative names.
+    in_video_section = not has_section_headers
     pending_camera: CameraInfo | None = None
 
     for line in output.splitlines():
         line = line.strip()
         if not line:
             continue
-
-        # Old-format section boundaries
         if "DirectShow video devices" in line:
             in_video_section = True
             continue
         if "DirectShow audio devices" in line:
             break
-
         if not in_video_section:
             continue
 
-        # Match: "Camera Name" (video)  or  "Microphone" (audio)
         dev_match = re.search(r'"(.+?)"\s*\((\w+)\)', line)
         if dev_match:
             dev_name = dev_match.group(1)
@@ -210,62 +223,223 @@ def _list_devices_windows() -> list[CameraInfo]:
                 idx = len(cameras)
                 escaped = dev_name.replace("\\", "\\\\").replace(":", "\\:")
                 pending_camera = CameraInfo(
-                    index=idx, name=dev_name,
-                    platform_id=f'video={escaped}',
+                    index=idx,
+                    name=dev_name,
+                    platform_id=f"video={escaped}",
                 )
                 cameras.append(pending_camera)
             else:
-                # Audio device — clear pending so its Alternative name
-                # doesn't overwrite the preceding video camera.
                 pending_camera = None
             continue
 
-        # New-format "Alternative name" — the unique DirectShow device
-        # path (e.g. @device_pnp_\\?\usb#vid_...).  Associate it with
-        # the video camera we just parsed.
-        if 'Alternative name' in line and pending_camera is not None:
+        if "Alternative name" in line and pending_camera is not None:
             alt_match = re.search(r'"(@[^"]+)"', line)
             if alt_match:
-                alt = alt_match.group(1)
-                pending_camera.platform_id = f'video={alt}'
-                logger.debug("  unique device path: %s", alt)
+                pending_camera.platform_id = f"video={alt_match.group(1)}"
             continue
 
-    # ── Post-process: disambiguate duplicate friendly names ──
-    # Two identical cameras (same model) share a friendly name.  Even when
-    # we have unique hardware paths (Alternative name → platform_id), the
-    # *display name* must differ so output directories and UI labels don't
-    # collide.  We append #1 / #2 suffixes to every duplicate.
+    return cameras
+
+
+def _suffix_duplicate_camera_names(cameras: list[CameraInfo]) -> None:
+    """Append #1/#2 to duplicate display names and set ordinal fallback."""
     name_counts: dict[str, int] = {}
     for cam in cameras:
         name_counts[cam.name] = name_counts.get(cam.name, 0) + 1
 
     dup_names = {n for n, c in name_counts.items() if c > 1}
-    if dup_names:
-        name_seen: dict[str, int] = {}
-        for cam in cameras:
-            if cam.name in dup_names:
-                name_seen[cam.name] = name_seen.get(cam.name, 0) + 1
-                suffix = f" #{name_seen[cam.name]}"
-                # If the platform_id is just the naive name-based id
-                # (no Alternative name available, old ffmpeg), keep the
-                # real DirectShow friendly name and disambiguate with
-                # -video_device_number instead of inventing a fake name.
-                _escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
-                if cam.platform_id == f'video={_escaped}':
-                    cam.device_number = name_seen[cam.name] - 1
-                    logger.warning(
-                        "Duplicate camera '%s' disambiguated with "
-                        "-video_device_number %d. "
-                        "Consider upgrading ffmpeg for hardware-path-based IDs.",
-                        cam.name, cam.device_number,
-                    )
-                cam.name += suffix
+    if not dup_names:
+        return
 
-    logger.info("Found %d dshow camera(s)", len(cameras))
-    for c in cameras:
-        logger.debug("  [%d] %s  →  %s", c.index, c.name, c.platform_id)
+    name_seen: dict[str, int] = {}
+    for cam in cameras:
+        if cam.name not in dup_names:
+            continue
+        name_seen[cam.name] = name_seen.get(cam.name, 0) + 1
+        suffix = f" #{name_seen[cam.name]}"
+        escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
+        if cam.platform_id == f"video={escaped}":
+            cam.device_number = name_seen[cam.name] - 1
+            logger.warning(
+                "Duplicate camera '%s' disambiguated with -video_device_number %d. "
+                "This is an ordinal fallback; prefer PnP/Alternative-name IDs.",
+                cam.name,
+                cam.device_number,
+            )
+        cam.name += suffix
+
+
+def _apply_pnp_stable_ids(
+    cameras: list[CameraInfo],
+    pnp_cameras: list[CameraInfo],
+) -> list[CameraInfo]:
+    """Replace friendly-name duplicate IDs with stable PnP monikers when possible."""
+    if not cameras or not pnp_cameras:
+        return cameras
+
+    pnp_by_name: dict[str, list[CameraInfo]] = {}
+    for cam in pnp_cameras:
+        pnp_by_name.setdefault(cam.name, []).append(cam)
+
+    occurrence: dict[str, int] = {}
+    for cam in cameras:
+        if "video=@device_pnp_" in cam.platform_id.lower():
+            continue
+        occurrence[cam.name] = occurrence.get(cam.name, 0) + 1
+        candidates = pnp_by_name.get(cam.name, [])
+        candidate_index = occurrence[cam.name] - 1
+        if candidate_index >= len(candidates):
+            continue
+        stable = candidates[candidate_index]
+        logger.info("Using stable PnP ID for camera '%s': %s", cam.name, stable.platform_id)
+        cam.platform_id = stable.platform_id
+        cam.device_number = None
     return cameras
+
+
+def _needs_pnp_stable_ids(cameras: list[CameraInfo]) -> bool:
+    """Return True when parsed dshow devices still depend on friendly-name ordinals."""
+    if not cameras:
+        return True
+    name_counts: dict[str, int] = {}
+    for cam in cameras:
+        name_counts[cam.name] = name_counts.get(cam.name, 0) + 1
+    for cam in cameras:
+        if name_counts[cam.name] <= 1:
+            continue
+        if "video=@device_pnp_" not in cam.platform_id.lower():
+            return True
+    return False
+
+
+def _list_devices_windows_pnp() -> list[CameraInfo]:
+    """Enumerate Windows cameras from PnP records and DirectShow registry links."""
+    records = _query_pnp_camera_records()
+    if not records:
+        return []
+
+    capture_links = _read_dshow_capture_links_from_registry()
+    cameras: list[CameraInfo] = []
+    seen: set[str] = set()
+    for rec in records:
+        name = rec.get("FriendlyName") or rec.get("Name") or ""
+        instance_id = rec.get("InstanceId") or rec.get("PNPDeviceID") or ""
+        if not name or not instance_id:
+            continue
+
+        alt = _find_capture_link_for_instance(instance_id, capture_links)
+        if alt is None:
+            alt = _dshow_alt_from_instance_id(instance_id)
+        platform_id = f"video={alt}"
+        if platform_id in seen:
+            continue
+        seen.add(platform_id)
+        cameras.append(CameraInfo(
+            index=len(cameras),
+            name=name,
+            platform_id=platform_id,
+        ))
+    return cameras
+
+
+def _query_pnp_camera_records() -> list[dict[str, str]]:
+    """Return Windows camera PnP records via PowerShell."""
+    ps = (
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "$OutputEncoding = [Console]::OutputEncoding; "
+        "$devices = @(); "
+        "foreach ($class in @('Camera','Image')) { "
+        "  try { $devices += Get-PnpDevice -Class $class -ErrorAction Stop } catch {} "
+        "} "
+        "$devices | Select-Object FriendlyName,Class,InstanceId,Status | "
+        "ConvertTo-Json -Depth 3"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+    except Exception:
+        logger.debug("Windows PnP camera query failed", exc_info=True)
+        return []
+
+    output = (proc.stdout or "").strip()
+    if not output:
+        if proc.stderr:
+            logger.debug("Windows PnP camera query stderr: %s", proc.stderr.strip())
+        return []
+
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        logger.debug("Could not parse Windows PnP camera JSON: %s", output)
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _read_dshow_capture_links_from_registry() -> list[str]:
+    """Read stable DirectShow capture symbolic links from DeviceClasses."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    path = (
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceClasses\\"
+        f"{{{DSHOW_CAPTURE_GUID}}}"
+    )
+    links: list[str] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            index = 0
+            while True:
+                try:
+                    child = winreg.EnumKey(key, index)
+                except OSError:
+                    break
+                index += 1
+                alt = _dshow_alt_from_registry_child(child)
+                if alt:
+                    links.append(alt)
+    except OSError:
+        logger.debug("Could not read DirectShow DeviceClasses registry", exc_info=True)
+    return links
+
+
+def _dshow_alt_from_registry_child(child: str) -> str | None:
+    """Convert a DeviceClasses child key into an ffmpeg dshow alternative name."""
+    prefix = "##?#"
+    if not child.startswith(prefix):
+        return None
+    body = child[len(prefix):].replace("\\", "#")
+    if f"#{{{DSHOW_CAPTURE_GUID}}}".lower() not in body.lower():
+        return None
+    return f"@device_pnp_\\\\?\\{body.lower()}\\global"
+
+
+def _dshow_alt_from_instance_id(instance_id: str) -> str:
+    """Construct the usual DirectShow capture moniker from a PnP instance ID."""
+    body = instance_id.strip().replace("\\", "#").lower()
+    return f"@device_pnp_\\\\?\\{body}#{{{DSHOW_CAPTURE_GUID}}}\\global"
+
+
+def _find_capture_link_for_instance(
+    instance_id: str,
+    capture_links: list[str],
+) -> str | None:
+    needle = instance_id.strip().replace("\\", "#").lower()
+    for link in capture_links:
+        if needle in link.lower():
+            return link
+    return None
 
 
 def _list_devices_linux() -> list[CameraInfo]:

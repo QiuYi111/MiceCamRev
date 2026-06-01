@@ -12,6 +12,8 @@ import pytest
 from micecam.camera_manager import (
     CameraInfo,
     EncoderInfo,
+    _dshow_alt_from_instance_id,
+    _dshow_alt_from_registry_child,
     _list_devices_darwin,
     _list_devices_windows,
     _query_caps_windows,
@@ -137,9 +139,9 @@ class TestWindowsDeviceListing:
         assert cameras[1].name == "Integrated Camera"
 
     def test_no_cameras(self) -> None:
-        with mock.patch(
-            "micecam.camera_manager._run_ffmpeg",
-            return_value="",
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=""),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
         assert cameras == []
@@ -197,9 +199,9 @@ class TestWindowsDeviceListing:
 [dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
 [dshow @ 0000021b8a9e2c00] DirectShow audio devices
 """
-        with mock.patch(
-            "micecam.camera_manager._run_ffmpeg",
-            return_value=output,
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
 
@@ -218,9 +220,12 @@ class TestWindowsDeviceListing:
 [in#0 @ 0000023be5915d00] "Twin Camera" (video)
 [in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#two"
 """
-        with mock.patch(
-            "micecam.camera_manager._run_ffmpeg",
-            return_value=output,
+        with (
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
+            mock.patch(
+                "micecam.camera_manager._run_ffmpeg",
+                return_value=output,
+            ),
         ):
             cameras = _list_devices_windows()
 
@@ -230,6 +235,68 @@ class TestWindowsDeviceListing:
             "video=@device_pnp_\\\\?\\usb#two",
         ]
         assert [c.device_number for c in cameras] == [None, None]
+
+    def test_duplicate_names_use_pnp_stable_ids_when_available(self) -> None:
+        """Duplicate friendly names should prefer stable PnP monikers over ordinals."""
+        output = """
+[dshow @ 0000021b8a9e2c00] DirectShow video devices
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00] DirectShow audio devices
+"""
+        pnp = [
+            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#one"),
+            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#two"),
+        ]
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+        ):
+            cameras = _list_devices_windows()
+
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=@device_pnp_\\\\?\\usb#one",
+            "video=@device_pnp_\\\\?\\usb#two",
+        ]
+        assert [c.device_number for c in cameras] == [None, None]
+
+    def test_falls_back_to_pnp_when_ffmpeg_outputs_only_errors(self) -> None:
+        """Non-empty ffmpeg error output must not block PnP fallback."""
+        pnp = [
+            CameraInfo(0, "HD USB Camera", "video=@device_pnp_\\\\?\\usb#stable")
+        ]
+        with (
+            mock.patch(
+                "micecam.camera_manager._run_ffmpeg",
+                return_value="Could not enumerate video devices\nError opening input file dummy.",
+            ),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+        ):
+            cameras = _list_devices_windows()
+
+        assert cameras == pnp
+
+    def test_construct_dshow_alt_from_pnp_instance_id(self) -> None:
+        alt = _dshow_alt_from_instance_id(
+            r"USB\VID_05A3&PID_9230&MI_00\6&1A643E73&0&0000"
+        )
+
+        assert alt == (
+            r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
+            r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+        )
+
+    def test_construct_dshow_alt_from_registry_child(self) -> None:
+        alt = _dshow_alt_from_registry_child(
+            r"##?#USB#VID_05A3&PID_9230&MI_00#6&1a643e73&0&0000"
+            r"#{65e8773d-8f56-11d0-a3b9-00a0c9223196}"
+        )
+
+        assert alt == (
+            r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
+            r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+        )
 
 
 class TestCameraInfo:
@@ -306,7 +373,8 @@ class TestListDevicesFallback:
         assert second_call_args[0] == "-f"
         assert second_call_args[1] == "dshow"
 
-    def test_both_fail_returns_empty(self) -> None:
+    @mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[])
+    def test_both_fail_returns_empty(self, _pnp: mock.Mock) -> None:
         """When both styles fail, return empty list."""
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
