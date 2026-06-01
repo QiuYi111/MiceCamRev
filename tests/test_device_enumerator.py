@@ -37,6 +37,16 @@ SAMPLE_DSHOW_OUTPUT = """
 [dshow @ 0000021b8a9e2c00]  "Microphone (Realtek Audio)" (audio)
 """
 
+# New ffmpeg 8+ output format — flat list, no section headers
+SAMPLE_DSHOW_OUTPUT_V8 = """
+[in#0 @ 0000023be5915d00] "Integrated Camera" (video)
+[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#vid_5986&pid_115f&mi_00#7&18f24fa2&1&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
+[in#0 @ 0000023be5915d00] "Headset Microphone (Oculus Virtual Audio Device)" (audio)
+[in#0 @ 0000023be5915d00]   Alternative name "@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\\wave_{82E191EC-03B1-48CF-8A24-763FCBAEDF88}"
+[in#0 @ 0000023be5915d00] "麦克风阵列 (Realtek(R) Audio)" (audio)
+Error opening input file dummy.
+"""
+
 SAMPLE_ENCODERS_OUTPUT = """
 Encoders:
  V..... libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part10 (codec h264)
@@ -90,6 +100,47 @@ class TestWindowsDeviceListing:
         ):
             cameras = _list_devices_windows()
         assert cameras == []
+
+    def test_parse_v8_flat_format(self) -> None:
+        """ffmpeg 8+ output: flat list, no section headers."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_DSHOW_OUTPUT_V8,
+        ):
+            cameras = _list_devices_windows()
+
+        assert len(cameras) == 1
+        assert cameras[0].name == "Integrated Camera"
+        assert cameras[0].platform_id == 'video="Integrated Camera"'
+
+    def test_v8_skips_alternative_names(self) -> None:
+        """Alternative name lines must not create duplicate entries."""
+        # Single camera with alternative name
+        output = """
+[in#0 @ 0000023be5915d00] "My Webcam" (video)
+[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#..."
+"""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=output,
+        ):
+            cameras = _list_devices_windows()
+        assert len(cameras) == 1
+        assert cameras[0].name == "My Webcam"
+
+    def test_v8_skips_audio_devices(self) -> None:
+        """Audio devices with (audio) suffix must not appear."""
+        output = """
+[in#0 @ 0000023be5915d00] "Integrated Camera" (video)
+[in#0 @ 0000023be5915d00] "Microphone" (audio)
+"""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=output,
+        ):
+            cameras = _list_devices_windows()
+        assert len(cameras) == 1
+        assert cameras[0].name == "Integrated Camera"
 
 
 class TestCameraInfo:

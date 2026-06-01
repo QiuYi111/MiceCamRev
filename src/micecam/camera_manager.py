@@ -132,9 +132,9 @@ def _list_devices_darwin() -> list[CameraInfo]:
 def _list_devices_windows() -> list[CameraInfo]:
     """List dshow cameras on Windows.
 
-    Uses ``-list_devices true`` (ffmpeg 7+) to enumerate video sources.
-    The flag must come *before* ``-f dshow`` so ffmpeg treats it as a
-    generic option, not a dshow-specific one.
+    Handles two ffmpeg output formats:
+    - Old (ffmpeg <7): ``[dshow @ ...] DirectShow video devices`` section header
+    - New (ffmpeg 8+): ``[in#0 @ ...] "Camera Name" (video)`` flat list
     """
     output = _run_ffmpeg(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
 
@@ -145,31 +145,37 @@ def _list_devices_windows() -> list[CameraInfo]:
     logger.debug("dshow device listing output:\n%s", output)
 
     cameras: list[CameraInfo] = []
-    in_video_section = False
+    has_section_headers = "DirectShow video devices" in output
+    in_video_section = not has_section_headers  # if no headers, parse all lines
+
     for line in output.splitlines():
         line = line.strip()
-        # Detect section boundaries
+        if not line:
+            continue
+
+        # Old-format section boundaries
         if "DirectShow video devices" in line:
             in_video_section = True
             continue
         if "DirectShow audio devices" in line:
             break
 
-        if in_video_section:
-            # Try two patterns:
-            # 1. "Camera Name" (video)   ← standard dshow output
-            # 2. Alternative: [dshow @ ...]  "Camera Name"
-            match = re.search(r'"(.+?)"\s*\(video\)', line)
-            if not match:
-                # Try alternative: quoted name anywhere in the line
-                match = re.search(r'"([^"]+)"', line)
-            if match:
-                name = match.group(1)
-                idx = len(cameras)
-                cameras.append(CameraInfo(
-                    index=idx, name=name,
-                    platform_id=f'video="{name}"',
-                ))
+        if not in_video_section:
+            continue
+
+        # Skip "Alternative name" lines (new format)
+        if 'Alternative name' in line:
+            continue
+
+        # Match: "Camera Name" (video)
+        match = re.search(r'"(.+?)"\s*\(video\)', line)
+        if match:
+            name = match.group(1)
+            idx = len(cameras)
+            cameras.append(CameraInfo(
+                index=idx, name=name,
+                platform_id=f'video="{name}"',
+            ))
 
     logger.info("Found %d dshow camera(s)", len(cameras))
     return cameras
