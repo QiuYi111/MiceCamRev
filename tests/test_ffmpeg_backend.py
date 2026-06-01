@@ -147,3 +147,23 @@ frame=  495 fps=0.0 q=-1.0 Lsize=N/A time=00:00:16.59 bitrate=N/A speed= 341x
         input_index = cmd.index("-i")
         assert cmd[wallclock_index + 1] == "1"
         assert wallclock_index < input_index
+
+    def test_build_command_uses_dshow_device_number(self, tmp_path: Path) -> None:
+        recorder = Recorder(
+            camera_id="video=Twin Camera",
+            native_codec="mjpeg",
+            camera_device_number=1,
+        )
+        with mock.patch("micecam.recorder.sys.platform", "win32"):
+            cmd = recorder._build_command(
+                resolution=(1920, 1080),
+                fps=30,
+                encoder="copy",
+                output_path=tmp_path / "out.mp4",
+            )
+
+        number_index = cmd.index("-video_device_number")
+        input_index = cmd.index("-i")
+        assert cmd[number_index + 1] == "1"
+        assert number_index < input_index
+        assert cmd[input_index + 1] == "video=Twin Camera"

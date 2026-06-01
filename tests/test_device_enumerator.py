@@ -145,7 +145,7 @@ class TestWindowsDeviceListing:
         assert cameras == []
 
     def test_parse_v8_flat_format(self) -> None:
-        """ffmpeg 8+ output: flat list, no section headers."""
+        """ffmpeg 8+ output: uses unique Alternative name as platform_id."""
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_DSHOW_OUTPUT_V8,
@@ -154,11 +154,14 @@ class TestWindowsDeviceListing:
 
         assert len(cameras) == 1
         assert cameras[0].name == "Integrated Camera"
-        assert cameras[0].platform_id == 'video=Integrated Camera'
+        # Alternative name is used as the unique platform_id
+        assert cameras[0].platform_id == (
+            'video=@device_pnp_\\\\?\\usb#vid_5986&pid_115f&mi_00'
+            '#7&18f24fa2&1&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global'
+        )
 
-    def test_v8_skips_alternative_names(self) -> None:
-        """Alternative name lines must not create duplicate entries."""
-        # Single camera with alternative name
+    def test_v8_uses_alternative_name_as_platform_id(self) -> None:
+        """Alternative name → unique platform_id; still one camera entry."""
         output = """
 [in#0 @ 0000023be5915d00] "My Webcam" (video)
 [in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#..."
@@ -170,6 +173,7 @@ class TestWindowsDeviceListing:
             cameras = _list_devices_windows()
         assert len(cameras) == 1
         assert cameras[0].name == "My Webcam"
+        assert cameras[0].platform_id == 'video=@device_pnp_\\\\?\\usb#...'
 
     def test_v8_skips_audio_devices(self) -> None:
         """Audio devices with (audio) suffix must not appear."""
@@ -184,6 +188,48 @@ class TestWindowsDeviceListing:
             cameras = _list_devices_windows()
         assert len(cameras) == 1
         assert cameras[0].name == "Integrated Camera"
+
+    def test_duplicate_names_without_alternative_use_device_numbers(self) -> None:
+        """Old dshow output has no hardware path; use device_number fallback."""
+        output = """
+[dshow @ 0000021b8a9e2c00] DirectShow video devices
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00] DirectShow audio devices
+"""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=output,
+        ):
+            cameras = _list_devices_windows()
+
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=Twin Camera",
+            "video=Twin Camera",
+        ]
+        assert [c.device_number for c in cameras] == [0, 1]
+
+    def test_duplicate_names_with_alternative_keep_unique_platform_ids(self) -> None:
+        """When hardware paths exist, no device number is needed."""
+        output = """
+[in#0 @ 0000023be5915d00] "Twin Camera" (video)
+[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#one"
+[in#0 @ 0000023be5915d00] "Twin Camera" (video)
+[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#two"
+"""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=output,
+        ):
+            cameras = _list_devices_windows()
+
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=@device_pnp_\\\\?\\usb#one",
+            "video=@device_pnp_\\\\?\\usb#two",
+        ]
+        assert [c.device_number for c in cameras] == [None, None]
 
 
 class TestCameraInfo:
@@ -338,6 +384,18 @@ class TestQueryCapsWindows:
         assert fps == []
         assert native == ""
         assert res_fps == {}
+
+    def test_query_caps_passes_device_number(self) -> None:
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_SINGLE,
+        ) as run:
+            _query_caps_windows("video=Twin Camera", device_number=1)
+
+        args = run.call_args.args[0]
+        assert args[0:2] == ["-f", "dshow"]
+        assert args[args.index("-video_device_number") + 1] == "1"
+        assert args[args.index("-i") + 1] == "video=Twin Camera"
 
     def test_vcodec_mjpeg_parsing(self) -> None:
         """vcodec=mjpeg (hardware-compressed) → native_codec = 'mjpeg'."""

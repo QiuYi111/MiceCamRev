@@ -45,6 +45,7 @@ class CameraInfo:
     index: int
     name: str
     platform_id: str  # platform-specific identifier (e.g. AVFoundation index)
+    device_number: int | None = None  # Windows dshow duplicate-name ordinal
     supported_resolutions: list[tuple[int, int]] = field(default_factory=list)
     supported_framerates: list[int] = field(default_factory=list)
     native_codec: str = ""  # camera's native output (e.g. "mjpeg", "yuyv422"), or "" if unknown
@@ -151,6 +152,15 @@ def _list_devices_windows() -> list[CameraInfo]:
     Tries two argument orders so both old and new ffmpeg builds work:
     1. ffmpeg 7+  treats ``-list_devices`` as a *generic* option (before ``-f``)
     2. ffmpeg <7 requires the *format-specific* position (after ``-f dshow``)
+
+    **Duplicate-camera disambiguation:** When two cameras share the same
+    friendly name (e.g. two identical USB cameras), the "Alternative name"
+    line from ffmpeg 8+ provides a unique DirectShow device path that
+    reliably identifies each physical device.  We use it as the
+    ``platform_id`` so ffmpeg can distinguish them.  On older ffmpeg
+    builds that lack alternative-name output we keep the friendly-name
+    ``platform_id`` and set ``device_number`` so ffmpeg can disambiguate
+    via ``-video_device_number``.
     """
     # ffmpeg 7+: generic option before -f
     output = _run_ffmpeg(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
@@ -171,6 +181,11 @@ def _list_devices_windows() -> list[CameraInfo]:
     has_section_headers = "DirectShow video devices" in output
     in_video_section = not has_section_headers  # if no headers, parse all lines
 
+    # Track the most recently seen *video* camera so we can associate
+    # the following "Alternative name" line with it.  Clear on audio
+    # devices to avoid cross-wiring their alternative names.
+    pending_camera: CameraInfo | None = None
+
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -186,26 +201,70 @@ def _list_devices_windows() -> list[CameraInfo]:
         if not in_video_section:
             continue
 
-        # Skip "Alternative name" lines (new format)
-        if 'Alternative name' in line:
+        # Match: "Camera Name" (video)  or  "Microphone" (audio)
+        dev_match = re.search(r'"(.+?)"\s*\((\w+)\)', line)
+        if dev_match:
+            dev_name = dev_match.group(1)
+            dev_kind = dev_match.group(2)
+            if dev_kind == "video":
+                idx = len(cameras)
+                escaped = dev_name.replace("\\", "\\\\").replace(":", "\\:")
+                pending_camera = CameraInfo(
+                    index=idx, name=dev_name,
+                    platform_id=f'video={escaped}',
+                )
+                cameras.append(pending_camera)
+            else:
+                # Audio device — clear pending so its Alternative name
+                # doesn't overwrite the preceding video camera.
+                pending_camera = None
             continue
 
-        # Match: "Camera Name" (video)
-        match = re.search(r'"(.+?)"\s*\(video\)', line)
-        if match:
-            name = match.group(1)
-            idx = len(cameras)
-            # Escape AVOption separators so ffmpeg doesn't misinterpret
-            # a device name containing ':' or '\' as option injection.
-            # (Shell quotes don't work here — subprocess list mode passes
-            # literal " chars to ffmpeg, which then fails to find the device.)
-            escaped = name.replace("\\", "\\\\").replace(":", "\\:")
-            cameras.append(CameraInfo(
-                index=idx, name=name,
-                platform_id=f'video={escaped}',
-            ))
+        # New-format "Alternative name" — the unique DirectShow device
+        # path (e.g. @device_pnp_\\?\usb#vid_...).  Associate it with
+        # the video camera we just parsed.
+        if 'Alternative name' in line and pending_camera is not None:
+            alt_match = re.search(r'"(@[^"]+)"', line)
+            if alt_match:
+                alt = alt_match.group(1)
+                pending_camera.platform_id = f'video={alt}'
+                logger.debug("  unique device path: %s", alt)
+            continue
+
+    # ── Post-process: disambiguate duplicate friendly names ──
+    # Two identical cameras (same model) share a friendly name.  Even when
+    # we have unique hardware paths (Alternative name → platform_id), the
+    # *display name* must differ so output directories and UI labels don't
+    # collide.  We append #1 / #2 suffixes to every duplicate.
+    name_counts: dict[str, int] = {}
+    for cam in cameras:
+        name_counts[cam.name] = name_counts.get(cam.name, 0) + 1
+
+    dup_names = {n for n, c in name_counts.items() if c > 1}
+    if dup_names:
+        name_seen: dict[str, int] = {}
+        for cam in cameras:
+            if cam.name in dup_names:
+                name_seen[cam.name] = name_seen.get(cam.name, 0) + 1
+                suffix = f" #{name_seen[cam.name]}"
+                # If the platform_id is just the naive name-based id
+                # (no Alternative name available, old ffmpeg), keep the
+                # real DirectShow friendly name and disambiguate with
+                # -video_device_number instead of inventing a fake name.
+                _escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
+                if cam.platform_id == f'video={_escaped}':
+                    cam.device_number = name_seen[cam.name] - 1
+                    logger.warning(
+                        "Duplicate camera '%s' disambiguated with "
+                        "-video_device_number %d. "
+                        "Consider upgrading ffmpeg for hardware-path-based IDs.",
+                        cam.name, cam.device_number,
+                    )
+                cam.name += suffix
 
     logger.info("Found %d dshow camera(s)", len(cameras))
+    for c in cameras:
+        logger.debug("  [%d] %s  →  %s", c.index, c.name, c.platform_id)
     return cameras
 
 
@@ -228,7 +287,8 @@ def _list_devices_linux() -> list[CameraInfo]:
 # ── Capability probing ────────────────────────────────────────────────────
 
 def _probe_capability(platform_id: str, width: int, height: int,
-                      fps: int, platform_name: str) -> bool:
+                      fps: int, platform_name: str,
+                      device_number: int | None = None) -> bool:
     """Test whether a camera supports a given resolution/fps combo.
 
     Prefer ``_query_caps_windows`` on Windows — this is a slow fallback.
@@ -246,6 +306,10 @@ def _probe_capability(platform_id: str, width: int, height: int,
             "-f", "dshow",
             "-framerate", str(fps),
             "-video_size", f"{width}x{height}",
+            *(
+                ["-video_device_number", str(device_number)]
+                if device_number is not None else []
+            ),
             "-i", platform_id,
             "-vframes", "1", "-f", "null", "-"
         ]
@@ -268,7 +332,7 @@ def _probe_capability(platform_id: str, width: int, height: int,
 _PASSTHROUGH_CODECS = frozenset({"mjpeg", "h264", "hevc"})
 
 
-def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int], str, dict[tuple[int, int], list[int]]]:
+def _query_caps_windows(platform_id: str, device_number: int | None = None) -> tuple[list[tuple[int, int]], list[int], str, dict[tuple[int, int], list[int]]]:
     """Query supported resolutions, framerates & native codec via ``-list_options``.
 
     Much faster than probing — ffmpeg directly enumerates the dshow pin caps.
@@ -282,7 +346,15 @@ def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[i
     from offering impossible combinations (e.g. 1920×1080 @ 120 fps).
     """
     output = _run_ffmpeg(
-        ["-f", "dshow", "-list_options", "true", "-i", platform_id],
+        [
+            "-f", "dshow",
+            "-list_options", "true",
+            *(
+                ["-video_device_number", str(device_number)]
+                if device_number is not None else []
+            ),
+            "-i", platform_id,
+        ],
         timeout=10,
     )
 
@@ -366,7 +438,9 @@ def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     On macOS/Linux, falls back to probe-each-combo (slower but works).
     """
     if platform_name == "Windows":
-        res, fps, native, res_fps = _query_caps_windows(camera.platform_id)
+        res, fps, native, res_fps = _query_caps_windows(
+            camera.platform_id, camera.device_number,
+        )
         if res:
             camera.supported_resolutions = res
             camera.supported_framerates = fps
@@ -379,7 +453,9 @@ def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     # Slow path: probe each common resolution/fps combo
     supported_res = []
     for w, h in COMMON_RESOLUTIONS:
-        if _probe_capability(camera.platform_id, w, h, 30, platform_name):
+        if _probe_capability(
+            camera.platform_id, w, h, 30, platform_name, camera.device_number,
+        ):
             supported_res.append((w, h))
     if not supported_res:
         supported_res = [(640, 480)]
@@ -387,8 +463,10 @@ def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     supported_fps = []
     test_res = supported_res[0]
     for fps in COMMON_FRAMERATES:
-        if _probe_capability(camera.platform_id, test_res[0], test_res[1],
-                             fps, platform_name):
+        if _probe_capability(
+            camera.platform_id, test_res[0], test_res[1],
+            fps, platform_name, camera.device_number,
+        ):
             supported_fps.append(fps)
     if not supported_fps:
         supported_fps = [30]

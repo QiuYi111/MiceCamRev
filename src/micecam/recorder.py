@@ -45,10 +45,12 @@ class Recorder:
 
     def __init__(self, camera_id: str, camera_name: str = "",
                  output_dir: Path = Path("./output"),
-                 native_codec: str = "") -> None:
+                 native_codec: str = "",
+                 camera_device_number: int | None = None) -> None:
         self.camera_id = camera_id          # platform-specific device id
         self.camera_name = camera_name       # human-readable label
         self.native_codec = native_codec     # camera's native output (e.g. "mjpeg")
+        self.camera_device_number = camera_device_number
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -326,6 +328,10 @@ class Recorder:
             input_args = [
                 "-f", "dshow",
                 "-use_wallclock_as_timestamps", "1",
+                *(
+                    ["-video_device_number", str(self.camera_device_number)]
+                    if self.camera_device_number is not None else []
+                ),
                 # Large real-time buffer prevents frame drops at high FPS.
                 # Default is tiny (~30 MB); 2000 MB is safe for 120fps streams.
                 "-rtbufsize", "2000M",
@@ -568,6 +574,7 @@ class Recorder:
             "camera": {
                 "id": self.camera_id,
                 "name": self.camera_name,
+                "device_number": self.camera_device_number,
                 "native_codec": self.native_codec,
             },
             "requested": {

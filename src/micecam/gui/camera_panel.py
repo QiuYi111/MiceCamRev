@@ -46,10 +46,12 @@ class PreviewThread(QtCore.QThread):
     preview_error = QtCore.pyqtSignal(str)
 
     def __init__(self, camera_id: str, fps: int = 30,
+                 device_number: int | None = None,
                  parent: Optional[QtCore.QObject] = None):
         super().__init__(parent)
         self.camera_id = camera_id
         self.fps = fps
+        self.device_number = device_number
         self._running = False
         self._process: Optional[subprocess.Popen] = None
 
@@ -70,6 +72,10 @@ class PreviewThread(QtCore.QThread):
             # e.g. 'video=Integrated Camera' (NO shell quotes — subprocess list mode)
             input_args = [
                 "-f", "dshow",
+                *(
+                    ["-video_device_number", str(self.device_number)]
+                    if self.device_number is not None else []
+                ),
                 "-framerate", str(self.fps),
                 "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
                 "-i", self.camera_id,
@@ -365,6 +371,10 @@ class CameraPanel(QtWidgets.QGroupBox):
         import threading
 
         cam_id = cam.platform_id
+        device_args = (
+            ["-video_device_number", str(cam.device_number)]
+            if cam.device_number is not None else []
+        )
 
         def _show_dialog_then_restart():
             try:
@@ -372,6 +382,7 @@ class CameraPanel(QtWidgets.QGroupBox):
                     [
                         get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
                         "-f", "dshow",
+                        *device_args,
                         "-show_video_device_dialog", "true",
                         "-i", cam_id,
                         "-vframes", "0",
@@ -436,7 +447,11 @@ class CameraPanel(QtWidgets.QGroupBox):
 
     def refresh_cameras(self, cameras: list[CameraInfo]) -> None:
         """Update the camera list (e.g., after a device change)."""
-        current_id = self._cam_combo.currentData()
+        current = self._cam_combo.currentData()
+        current_key = (
+            (current.platform_id, current.device_number)
+            if current is not None else None
+        )
         self._cameras = cameras
         self._cam_combo.blockSignals(True)
         self._cam_combo.clear()
@@ -444,9 +459,10 @@ class CameraPanel(QtWidgets.QGroupBox):
             self._cam_combo.addItem(f"[{cam.index}] {cam.name}", cam)
         # Restore selection
         restored = False
-        if current_id:
+        if current_key:
             for i in range(self._cam_combo.count()):
-                if self._cam_combo.itemData(i) is current_id:
+                cam = self._cam_combo.itemData(i)
+                if (cam.platform_id, cam.device_number) == current_key:
                     self._cam_combo.setCurrentIndex(i)
                     restored = True
                     break
@@ -468,7 +484,12 @@ class CameraPanel(QtWidgets.QGroupBox):
             if f <= 30 and (30 - f) < (30 - preview_fps):
                 preview_fps = f
         logger.debug("Preview using %d fps (supported: %s)", preview_fps, supported)
-        self._preview_thread = PreviewThread(cam.platform_id, fps=preview_fps, parent=self)
+        self._preview_thread = PreviewThread(
+            cam.platform_id,
+            fps=preview_fps,
+            device_number=cam.device_number,
+            parent=self,
+        )
         self._preview_thread.frame_ready.connect(self._on_frame)
         self._preview_thread.preview_error.connect(self._on_preview_error)
         self._preview_thread.start()
@@ -526,6 +547,7 @@ class CameraPanel(QtWidgets.QGroupBox):
             camera_name=cam.name,
             output_dir=output_dir,
             native_codec=cam.native_codec,
+            camera_device_number=cam.device_number,
         )
 
     def get_config(self) -> dict:
