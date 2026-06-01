@@ -173,6 +173,8 @@ class TimestampWriter:
         with open(self._path, "w", encoding="utf-8") as f:
             for h in header_lines:
                 f.write(h + "\n")
+            f.write("# timing_model: uniform_estimate_over_monotonic_duration\n")
+            f.write("# timestamp_source: recorder_monotonic_clock\n")
             f.write("\n")
 
             for frame_idx in range(total_frames):
@@ -201,6 +203,71 @@ class TimestampWriter:
 
         logger.info("SRT finalized: %d frames over %.3f s (%.3f ms/frame)",
                     total_frames, duration_seconds, frame_duration * 1000)
+
+    def finalize_absolute_times(self, frame_wall_times: list[float]) -> None:
+        """Generate SRT entries from per-frame absolute wall-clock times."""
+        if self._file is None:
+            return
+
+        self._file.close()
+        if not frame_wall_times:
+            logger.warning("No frame timestamps recorded, SRT file will be empty")
+            return
+
+        header_lines: list[str] = []
+        with open(self._path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    header_lines.append(line.rstrip("\n"))
+                else:
+                    break
+
+        first_wall = frame_wall_times[0]
+        intervals = [
+            b - a for a, b in zip(frame_wall_times, frame_wall_times[1:])
+            if b > a
+        ]
+        fallback_interval = (
+            sorted(intervals)[len(intervals) // 2]
+            if intervals
+            else 1.0 / 30.0
+        )
+
+        with open(self._path, "w", encoding="utf-8") as f:
+            for h in header_lines:
+                f.write(h + "\n")
+            f.write("# timing_model: per_frame_ffmpeg_demuxer_wallclock_pts\n")
+            f.write("# timestamp_source: ffmpeg_demuxer_pkt_pts_time\n")
+            f.write("\n")
+
+            for frame_idx, actual_wall in enumerate(frame_wall_times):
+                frame_num = frame_idx + 1
+                next_wall = (
+                    frame_wall_times[frame_idx + 1]
+                    if frame_idx + 1 < len(frame_wall_times)
+                    else actual_wall + fallback_interval
+                )
+                start_s = max(0.0, actual_wall - first_wall)
+                end_s = max(start_s + 0.001, next_wall - first_wall)
+
+                whole_sec = int(actual_wall)
+                nanos = int((actual_wall - whole_sec) * 1e9)
+                ts_str = datetime.fromtimestamp(
+                    whole_sec, tz=timezone.utc
+                ).strftime(self._time_fmt)
+                ts_full = f"{ts_str}.{nanos:09d}"
+
+                f.write(
+                    f"{frame_num}\n"
+                    f"{self._seconds_to_srt_timecode(start_s)} --> "
+                    f"{self._seconds_to_srt_timecode(end_s)}\n"
+                    f"ts={ts_full}  frame={frame_num}\n\n"
+                )
+
+        logger.info(
+            "SRT finalized from %d per-frame ffmpeg timestamps",
+            len(frame_wall_times),
+        )
 
     # ── helpers ───────────────────────────────────────────────────────
 

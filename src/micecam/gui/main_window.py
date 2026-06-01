@@ -182,12 +182,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        # Pause previews during recording — many dshow cameras cannot serve
+        # multiple ffmpeg clients simultaneously.
+        self._panel1._stop_preview()
+        self._panel2._stop_preview()
+
         try:
             self._sync.start_both(
                 rec_a, cfg1["resolution"], cfg1["fps"], cfg1["codec"],
                 rec_b, cfg2["resolution"], cfg2["fps"], cfg2["codec"],
             )
         except Exception as exc:
+            # Restart previews on failure
+            self._panel1._start_preview(self._panel1._current_camera)
+            self._panel2._start_preview(self._panel2._current_camera)
             QtWidgets.QMessageBox.critical(
                 self, "Sync Error", f"Failed to start synced recording:\n{exc}",
             )
@@ -240,6 +248,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self._status_bar.showMessage("Recording stopped — files saved")
+
+        # Restart previews now that recording has finished
+        self._panel1._start_preview(self._panel1._current_camera)
+        self._panel2._start_preview(self._panel2._current_camera)
 
     # ── About ────────────────────────────────────────────────────────
 

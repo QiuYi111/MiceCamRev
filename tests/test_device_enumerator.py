@@ -278,7 +278,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_OUTPUT,
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
 
         assert (1920, 1080) in res
         assert (640, 480) in res
@@ -289,6 +289,11 @@ class TestQueryCapsWindows:
         assert res[0] == (1920, 1080)
         # pixel_format=mjpeg is preferred (first compressed codec)
         assert native == "mjpeg"
+        # Per-resolution FPS: MJPEG pin covers 320x240→1920x1080
+        assert (1920, 1080) in res_fps
+        assert 30 in res_fps[(1920, 1080)]
+        assert (320, 240) in res_fps
+        assert 15 in res_fps[(320, 240)]
 
     def test_parse_decimal_fps(self) -> None:
         """Decimal fps values like 30.00 must be parsed as int 30."""
@@ -296,7 +301,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_DECIMAL_FPS,
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
 
         assert (1920, 1080) in res
         assert (640, 480) in res
@@ -306,6 +311,7 @@ class TestQueryCapsWindows:
         # No float values should leak through
         assert all(isinstance(f, int) for f in fps)
         assert native == "mjpeg"
+        assert (1920, 1080) in res_fps
 
     def test_parse_single_resolution(self) -> None:
         """Devices with only one resolution (no min/max split)."""
@@ -313,21 +319,25 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_SINGLE,
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
 
         assert res == [(640, 480)]
         assert fps == [30]
         assert native == "yuyv422"
+        # pixel_format=yuyv422 → no MJPEG pin, falls back to raw_res_fps
+        assert (640, 480) in res_fps
+        assert res_fps[(640, 480)] == [30]
 
     def test_empty_output(self) -> None:
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
             return_value="",
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
         assert res == []
         assert fps == []
         assert native == ""
+        assert res_fps == {}
 
     def test_vcodec_mjpeg_parsing(self) -> None:
         """vcodec=mjpeg (hardware-compressed) → native_codec = 'mjpeg'."""
@@ -335,7 +345,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_VCODEC,
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
 
         assert (1280, 720) in res
         assert (640, 480) in res
@@ -343,6 +353,11 @@ class TestQueryCapsWindows:
         assert fps == [30]
         # vcodec=mjpeg takes priority over pixel_format=yuyv422
         assert native == "mjpeg"
+        # Per-resolution map from vcodec=mjpeg pins
+        assert (1280, 720) in res_fps
+        assert res_fps[(1280, 720)] == [30]
+        assert (640, 480) in res_fps
+        assert (320, 240) in res_fps
 
     def test_raw_only_no_passthrough(self) -> None:
         """Camera with only raw pixel formats — no passthrough codec."""
@@ -350,11 +365,14 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_RAW_ONLY,
         ):
-            res, fps, native = _query_caps_windows('video=Test')
+            res, fps, native, res_fps = _query_caps_windows('video=Test')
 
         assert (640, 480) in res
         assert (320, 240) in res
         assert native == "nv12"  # alphabetically first raw format
+        # No MJPEG pin → falls back to raw pixel_format map
+        assert (640, 480) in res_fps
+        assert (320, 240) in res_fps
 
 
 class TestRunFfmpegEncoding:

@@ -96,7 +96,7 @@ class PreviewThread(QtCore.QThread):
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
             )
         except FileNotFoundError:
@@ -104,6 +104,7 @@ class PreviewThread(QtCore.QThread):
             return
 
         frame_size = PREVIEW_W * PREVIEW_H * 3  # RGB24 = 3 bytes/pixel
+        first_frame = True
         stdout = self._process.stdout
         while self._running and self._process.poll() is None:
             try:
@@ -113,6 +114,10 @@ class PreviewThread(QtCore.QThread):
             if len(raw) < frame_size:
                 break
 
+            if first_frame:
+                first_frame = False
+                logger.debug("Preview: first frame received for %s", self.camera_id)
+
             # Build QImage from raw RGB24 data
             image = QtGui.QImage(
                 raw, PREVIEW_W, PREVIEW_H, PREVIEW_W * 3,
@@ -121,27 +126,54 @@ class PreviewThread(QtCore.QThread):
             if not image.isNull():
                 self.frame_ready.emit(image.copy())  # copy for thread safety
 
+        # If the process exited before we ever got a frame, read stderr for diagnostics
+        if first_frame and self._process is not None:
+            stderr_output = ""
+            try:
+                stderr_output = self._process.stderr.read().decode(
+                    "utf-8", errors="replace"
+                ) if self._process.stderr else ""
+            except Exception:
+                pass
+            err_msg = stderr_output.strip() or "Preview process exited without output"
+            logger.error("Preview failed for %s: %s", self.camera_id, err_msg)
+            self.preview_error.emit(err_msg[:200])
+
         self._cleanup()
 
     def stop(self) -> None:
         """Signal the thread to stop and clean up the ffmpeg process."""
         self._running = False
         self._cleanup()
-        self.wait(timeout=3000)
+        self.wait(3000)  # PyQt6: QThread.wait(time) — positional, milliseconds
 
     def _cleanup(self) -> None:
         proc = self._process
-        if proc and proc.poll() is None:
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return  # already exited
+
+        # Close stdout to unblock any pending read
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+        # Graceful terminate, then force-kill after a short grace period
+        try:
+            proc.terminate()
             try:
-                if proc.stdout:
-                    proc.stdout.close()
-                proc.terminate()
-                self._process.wait(timeout=3)
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
             except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
+                pass
 
 
 # ── Camera panel widget ─────────────────────────────────────────────
@@ -173,6 +205,7 @@ class CameraPanel(QtWidgets.QGroupBox):
 
     recording_started = QtCore.pyqtSignal(str)   # camera_name
     recording_stopped = QtCore.pyqtSignal(str)   # camera_name
+    _props_closed = QtCore.pyqtSignal()          # internal: camera property dialog closed
 
     def __init__(self, panel_id: int,
                  cameras: list[CameraInfo],
@@ -185,6 +218,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._current_camera: Optional[CameraInfo] = None
 
         self.setTitle(f"Camera {panel_id + 1}")
+        self._props_closed.connect(self._on_properties_closed)
         self._build_ui()
         self._populate_cameras()
 
@@ -211,9 +245,23 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         self._cam_combo = QtWidgets.QComboBox()
         self._cam_combo.currentIndexChanged.connect(self._on_camera_changed)
-        form.addRow("Camera:", self._cam_combo)
+
+        self._cam_props_btn = QtWidgets.QPushButton("⚙ Properties")
+        self._cam_props_btn.setToolTip(
+            "Open the camera's DirectShow property dialog.\n"
+            "Use this to adjust exposure, gain, anti-flicker, and other\n"
+            "driver-level settings that affect framerate."
+        )
+        self._cam_props_btn.setMinimumHeight(24)
+        self._cam_props_btn.clicked.connect(self._open_camera_properties)
+
+        cam_row = QtWidgets.QHBoxLayout()
+        cam_row.addWidget(self._cam_combo, 1)
+        cam_row.addWidget(self._cam_props_btn, 0)
+        form.addRow("Camera:", cam_row)
 
         self._res_combo = QtWidgets.QComboBox()
+        self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
         form.addRow("Resolution:", self._res_combo)
 
         self._fps_combo = QtWidgets.QComboBox()
@@ -269,17 +317,122 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._current_camera = cam
 
         # Populate resolution dropdown
+        self._res_combo.blockSignals(True)
         self._res_combo.clear()
         for w, h in cam.supported_resolutions:
             self._res_combo.addItem(f"{w}×{h}", (w, h))
+        self._res_combo.blockSignals(False)
 
-        # Populate fps dropdown
-        self._fps_combo.clear()
-        for fps in cam.supported_framerates:
-            self._fps_combo.addItem(f"{fps} fps", fps)
+        # Populate FPS dropdown for the first resolution
+        if cam.supported_resolutions:
+            self._update_fps_for_resolution(cam.supported_resolutions[0])
 
         # Start preview for this camera
         self._start_preview(cam)
+
+    def _on_resolution_changed(self, index: int) -> None:
+        """When the user picks a different resolution, update the FPS dropdown
+        to show only framerates the camera actually supports at that resolution."""
+        res = self._res_combo.itemData(index)
+        if res:
+            self._update_fps_for_resolution(res)
+
+    def _open_camera_properties(self) -> None:
+        """Open the camera's DirectShow property dialog.
+
+        This allows the user to adjust driver-level settings (exposure,
+        auto-exposure, low-light compensation, gain, anti-flicker, etc.)
+        that ffmpeg cannot control via CLI.  These settings directly affect
+        the camera's actual output framerate.
+
+        The preview is paused while the dialog is open because the camera
+        cannot be accessed by two processes simultaneously.
+        """
+        cam = self._current_camera
+        if cam is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Camera", "Select a camera first.",
+            )
+            return
+
+        # Pause preview — the property dialog needs exclusive camera access
+        self._stop_preview()
+
+        # Launch ffmpeg to show the DirectShow property page.
+        # We use a subprocess in a daemon thread: the Windows property sheet
+        # is a modal dialog that blocks ffmpeg, but Qt's event loop stays
+        # responsive because we don't call .join() on the main thread.
+        import threading
+
+        cam_id = cam.platform_id
+
+        def _show_dialog_then_restart():
+            try:
+                proc = subprocess.run(
+                    [
+                        get_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+                        "-f", "dshow",
+                        "-show_video_device_dialog", "true",
+                        "-i", cam_id,
+                        "-vframes", "0",
+                        "-f", "null", "-",
+                    ],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                    timeout=120,
+                )
+                if proc.returncode != 0:
+                    logger.warning(
+                        "Camera property dialog exited with code %d: %s",
+                        proc.returncode, proc.stderr.strip() or proc.stdout.strip(),
+                    )
+            except subprocess.TimeoutExpired:
+                logger.warning("Camera property dialog timed out")
+            except Exception:
+                logger.exception("Unexpected error opening camera properties")
+            finally:
+                # Restart preview from the main thread via signal
+                self._props_closed.emit()
+
+        t = threading.Thread(target=_show_dialog_then_restart, daemon=True)
+        t.start()
+
+    def _on_properties_closed(self) -> None:
+        """Callback after the camera property dialog closes — restart preview."""
+        if self._current_camera:
+            self._start_preview(self._current_camera)
+
+    def _update_fps_for_resolution(self, res: tuple[int, int]) -> None:
+        """Populate the FPS dropdown with values valid for *res*.
+
+        If the camera has per-resolution FPS data (Windows dshow), use it.
+        Otherwise fall back to the global framerate list.
+        """
+        cam = self._current_camera
+        if cam is None:
+            return
+
+        # Use per-resolution FPS map if available (Windows); fall back to flat list
+        if cam.resolution_fps and res in cam.resolution_fps:
+            fps_list = cam.resolution_fps[res]
+        else:
+            fps_list = cam.supported_framerates
+
+        previous = self._fps_combo.currentData()
+        self._fps_combo.clear()
+        for fps in fps_list:
+            self._fps_combo.addItem(f"{fps} fps", fps)
+
+        # Restore previous FPS selection if still valid
+        if previous and previous in fps_list:
+            idx = fps_list.index(previous)
+            self._fps_combo.setCurrentIndex(idx)
+        elif fps_list:
+            # Default to a moderate FPS: prefer 30, then the closest value
+            if 30 in fps_list:
+                self._fps_combo.setCurrentIndex(fps_list.index(30))
+            else:
+                self._fps_combo.setCurrentIndex(0)
 
     def refresh_cameras(self, cameras: list[CameraInfo]) -> None:
         """Update the camera list (e.g., after a device change)."""
@@ -306,9 +459,16 @@ class CameraPanel(QtWidgets.QGroupBox):
 
     def _start_preview(self, cam: CameraInfo) -> None:
         self._stop_preview()
-        # Use the camera's actual supported framerate (highest first in list)
-        fps = cam.supported_framerates[0] if cam.supported_framerates else 30
-        self._preview_thread = PreviewThread(cam.platform_id, fps=fps, parent=self)
+        # Preview always runs at a moderate framerate — high FPS (e.g. 120)
+        # is rarely supported at 640×480 and would cause ffmpeg to fail.
+        # Pick the closest fps ≤ 30 from the camera's supported list.
+        supported = cam.supported_framerates or [30]
+        preview_fps = 30
+        for f in supported:
+            if f <= 30 and (30 - f) < (30 - preview_fps):
+                preview_fps = f
+        logger.debug("Preview using %d fps (supported: %s)", preview_fps, supported)
+        self._preview_thread = PreviewThread(cam.platform_id, fps=preview_fps, parent=self)
         self._preview_thread.frame_ready.connect(self._on_frame)
         self._preview_thread.preview_error.connect(self._on_preview_error)
         self._preview_thread.start()
@@ -421,9 +581,17 @@ class CameraPanel(QtWidgets.QGroupBox):
         if self._recorder is None:
             return
 
+        # Pause preview during recording — many dshow cameras cannot serve
+        # two ffmpeg clients simultaneously, and sharing USB bandwidth between
+        # a preview stream and a recording stream causes frame drops.
+        self._stop_preview()
+
         try:
             output_path = self._recorder.start(**cfg)
         except Exception as exc:
+            # Restart preview on failure
+            if self._current_camera:
+                self._start_preview(self._current_camera)
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start recording:\n{exc}")
             return
 
@@ -441,6 +609,10 @@ class CameraPanel(QtWidgets.QGroupBox):
             return
 
         self._update_ui_recording_stopped(mp4_path.name, srt_path.name)
+
+        # Restart preview now that recording has finished
+        if self._current_camera:
+            self._start_preview(self._current_camera)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

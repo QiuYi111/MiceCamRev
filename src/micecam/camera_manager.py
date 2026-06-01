@@ -48,6 +48,9 @@ class CameraInfo:
     supported_resolutions: list[tuple[int, int]] = field(default_factory=list)
     supported_framerates: list[int] = field(default_factory=list)
     native_codec: str = ""  # camera's native output (e.g. "mjpeg", "yuyv422"), or "" if unknown
+    # Per-resolution FPS limits: {(w,h): [fps_values]}.
+    # Populated on Windows via -list_options; empty on macOS/Linux (fallback to probing).
+    resolution_fps: dict[tuple[int, int], list[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -265,59 +268,77 @@ def _probe_capability(platform_id: str, width: int, height: int,
 _PASSTHROUGH_CODECS = frozenset({"mjpeg", "h264", "hevc"})
 
 
-def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int], str]:
+def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int], str, dict[tuple[int, int], list[int]]]:
     """Query supported resolutions, framerates & native codec via ``-list_options``.
 
     Much faster than probing — ffmpeg directly enumerates the dshow pin caps.
-    Returns (resolutions, framerates, native_codec).
+    Returns (resolutions, framerates, native_codec, resolution_fps_map).
 
     *native_codec* is the camera's preferred compressed output (e.g. ``"mjpeg"``),
     or a raw pixel format (``"yuyv422"``), or ``""`` if parsing failed.
+
+    *resolution_fps_map* maps each (width, height) to the list of FPS values
+    the camera actually supports at that resolution — this prevents the UI
+    from offering impossible combinations (e.g. 1920×1080 @ 120 fps).
     """
     output = _run_ffmpeg(
         ["-f", "dshow", "-list_options", "true", "-i", platform_id],
         timeout=10,
     )
 
-    resolutions: set[tuple[int, int]] = set()
-    framerates: set[int] = set()
+    # Collect per-format capabilities: {(w,h): set(fps)} for each codec type
+    mjpeg_res_fps: dict[tuple[int, int], set[int]] = {}
+    raw_res_fps: dict[tuple[int, int], set[int]] = {}
     vcodecs: set[str] = set()
     pixel_formats: set[str] = set()
 
-    # Parse lines like:
-    #   vcodec=mjpeg  min s=320x240 fps=15 max s=1920x1080 fps=30
-    #   pixel_format=yuyv422 min s=640x480 fps=30 max s=640x480 fps=30
-    # fps may be integer ("30") or decimal ("30.00") depending on ffmpeg build
+    # Also collect flat sets for backward compatibility
+    all_resolutions: set[tuple[int, int]] = set()
+    all_framerates: set[int] = set()
+
     for line in output.splitlines():
         # Capture the prefix: vcodec=XXX or pixel_format=XXX
         codec_match = re.search(r'\b(vcodec|pixel_format)=(\S+)', line)
-        if codec_match:
-            kind, value = codec_match.group(1), codec_match.group(2)
-            if kind == "vcodec":
-                vcodecs.add(value)
-            else:
-                pixel_formats.add(value)
+        codec_kind = codec_match.group(1) if codec_match else None
+        codec_value = codec_match.group(2) if codec_match else None
 
-        # Look for max resolution/fps at the end of capability lines
-        match = re.search(r'max\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)', line)
-        if match:
+        if codec_kind == "vcodec":
+            vcodecs.add(codec_value)
+        elif codec_kind == "pixel_format":
+            pixel_formats.add(codec_value)
+
+        # Determine whether this line describes a passthrough-capable MJPEG pin.
+        # Old ffmpeg builds use "pixel_format=mjpeg"; new builds use "vcodec=mjpeg".
+        # Both mean the camera can deliver hardware-compressed MJPEG frames.
+        is_mjpeg_pin = (
+            (codec_kind == "vcodec" and codec_value in _PASSTHROUGH_CODECS)
+            or (codec_kind == "pixel_format" and codec_value == "mjpeg")
+        )
+
+        # Parse fps and resolution from min/max lines.
+        # Pattern:  min s=WxH fps=F  max s=WxH fps=F
+        # fps may be integer ("30") or decimal ("30.00", "120.101")
+        for match in re.finditer(r's=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)', line):
             w, h = int(match.group(1)), int(match.group(2))
             fps = int(float(match.group(3)))
-            resolutions.add((w, h))
-            framerates.add(fps)
-        # Some lines have only one resolution (min == max omitted);
-        # also matches the *min* values from min-max lines (broadens coverage)
-        match = re.search(r's=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)', line)
-        if match:
-            w, h = int(match.group(1)), int(match.group(2))
-            fps = int(float(match.group(3)))
-            resolutions.add((w, h))
-            framerates.add(fps)
+            all_resolutions.add((w, h))
+            all_framerates.add(fps)
+            # Store per-codec: MJPEG pins support higher FPS than raw pins
+            if is_mjpeg_pin:
+                mjpeg_res_fps.setdefault((w, h), set()).add(fps)
+            else:
+                raw_res_fps.setdefault((w, h), set()).add(fps)
+
+    # Prefer MJPEG (compressed) capabilities; fall back to raw pixel formats.
+    # MJPEG pins always offer higher FPS at any given resolution.
+    if mjpeg_res_fps:
+        res_fps_map = {res: sorted(fps, reverse=True) for res, fps in mjpeg_res_fps.items()}
+    else:
+        res_fps_map = {res: sorted(fps, reverse=True) for res, fps in raw_res_fps.items()}
 
     # Prefer compressed vcodecs (passthrough-capable), then raw pixel formats
     native_codec = ""
     if vcodecs:
-        # Pick the first compressed codec we know how to passthrough
         for c in sorted(vcodecs):
             if c in _PASSTHROUGH_CODECS:
                 native_codec = c
@@ -327,26 +348,30 @@ def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[i
     elif pixel_formats:
         native_codec = sorted(pixel_formats)[0]
 
-    res_list = sorted(resolutions, key=lambda r: (-r[0], -r[1]))  # highest first
-    fps_list = sorted(framerates, reverse=True)
+    res_list = sorted(all_resolutions, key=lambda r: (-r[0], -r[1]))  # highest first
+    fps_list = sorted(all_framerates, reverse=True)
     logger.info("dshow caps for %s: res=%s fps=%s native=%s",
                 platform_id, res_list, fps_list, native_codec)
-    return res_list, fps_list, native_codec
+    for (rw, rh), rfps in res_fps_map.items():
+        logger.debug("  %dx%d → %s fps", rw, rh, rfps)
+    return res_list, fps_list, native_codec, res_fps_map
 
 
 def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     """Probe which resolutions/framerates the camera supports.
 
     On Windows, uses the fast ``-list_options`` path which also captures
-    the camera's native output codec (e.g. ``mjpeg``) for passthrough recording.
+    the camera's native output codec (e.g. ``mjpeg``) for passthrough recording
+    and per-resolution FPS limits so the UI can offer valid combinations only.
     On macOS/Linux, falls back to probe-each-combo (slower but works).
     """
     if platform_name == "Windows":
-        res, fps, native = _query_caps_windows(camera.platform_id)
+        res, fps, native, res_fps = _query_caps_windows(camera.platform_id)
         if res:
             camera.supported_resolutions = res
             camera.supported_framerates = fps
             camera.native_codec = native
+            camera.resolution_fps = res_fps
             return
         # Fall through to probing if list_options gave nothing
         logger.warning("_query_caps_windows empty, falling back to probing")

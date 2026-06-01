@@ -117,3 +117,33 @@ class TestTimestampWriter:
         tw.finalize(duration_seconds=10.0, total_frames=0)
         # File should exist (header written by start)
         assert srt_path.exists()
+
+    def test_finalize_labels_timing_model(self, tmp_path: Path) -> None:
+        """SRT output should disclose the timestamp estimation model."""
+        srt_path = tmp_path / "test.srt"
+        tw = TimestampWriter(srt_path)
+        tw.start(wall_start=1717171200.0, steady_start=1_000_000_000)
+        tw.finalize(duration_seconds=1.0, total_frames=1)
+
+        content = srt_path.read_text()
+        assert "# timing_model: uniform_estimate_over_monotonic_duration" in content
+        assert "# timestamp_source: recorder_monotonic_clock" in content
+
+    def test_finalize_absolute_times_uses_per_frame_timestamps(
+        self, tmp_path: Path
+    ) -> None:
+        """Per-frame ffmpeg timestamps should be written without averaging."""
+        srt_path = tmp_path / "test.srt"
+        tw = TimestampWriter(srt_path)
+        tw.start(wall_start=1717171200.0, steady_start=1_000_000_000)
+        tw.finalize_absolute_times([
+            1717171200.100,
+            1717171200.150,
+            1717171200.260,
+        ])
+
+        content = srt_path.read_text()
+        assert "# timing_model: per_frame_ffmpeg_demuxer_wallclock_pts" in content
+        assert "00:00:00,000 --> 00:00:00,050" in content
+        assert "00:00:00,050 --> 00:00:00,160" in content
+        assert "frame=3" in content

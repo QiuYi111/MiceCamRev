@@ -81,17 +81,35 @@ class SyncController:
         )
 
         # 2. Launch both ffmpeg processes back-to-back (no blocking between them)
-        rec_a.start(
-            resolution=res_a, fps=fps_a, codec=codec_a,
-            wall_start=self.wall_start, steady_start=self.steady_start,
-        )
-        self._recorders.append(rec_a)
+        try:
+            rec_a.start(
+                resolution=res_a, fps=fps_a, codec=codec_a,
+                wall_start=self.wall_start, steady_start=self.steady_start,
+                wait_for_ready=False,
+            )
+            self._recorders.append(rec_a)
 
-        rec_b.start(
-            resolution=res_b, fps=fps_b, codec=codec_b,
-            wall_start=self.wall_start, steady_start=self.steady_start,
-        )
-        self._recorders.append(rec_b)
+            rec_b.start(
+                resolution=res_b, fps=fps_b, codec=codec_b,
+                wall_start=self.wall_start, steady_start=self.steady_start,
+                wait_for_ready=False,
+            )
+            self._recorders.append(rec_b)
+
+            for rec in self._recorders:
+                rec.wait_until_ready()
+        except Exception:
+            for rec in list(self._recorders):
+                if rec.is_recording():
+                    try:
+                        rec.stop()
+                    except Exception:
+                        logger.exception(
+                            "Error cleaning up recorder %s after sync start failure",
+                            rec.camera_name,
+                        )
+            self._recorders.clear()
+            raise
 
         logger.info("Both recorders started with shared time base")
 
