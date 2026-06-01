@@ -47,6 +47,7 @@ class CameraInfo:
     platform_id: str  # platform-specific identifier (e.g. AVFoundation index)
     supported_resolutions: list[tuple[int, int]] = field(default_factory=list)
     supported_framerates: list[int] = field(default_factory=list)
+    native_codec: str = ""  # camera's native output (e.g. "mjpeg", "yuyv422"), or "" if unknown
 
 
 @dataclass
@@ -79,12 +80,20 @@ def get_ffmpeg_path() -> str:
 
 
 def _run_ffmpeg(args: list[str], timeout: float = 10) -> str:
-    """Run ffmpeg and return combined stderr+stdout as string."""
+    """Run ffmpeg and return combined stderr+stdout as string.
+
+    On Windows, ``text=True`` defaults to the system ANSI code page
+    (e.g. cp1252 or gbk), but ffmpeg always emits UTF-8.  We force
+    UTF-8 with surrogate escaping so non-ASCII camera names (Chinese,
+    Japanese, etc.) on non-UTF-8 Windows systems don't cause silent
+    decode errors that would make *all* cameras invisible.
+    """
     ffmpeg = get_ffmpeg_path()
     try:
         proc = subprocess.run(
             [ffmpeg, "-hide_banner"] + args,
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
         )
         return (proc.stderr or "") + (proc.stdout or "")
     except FileNotFoundError:
@@ -135,11 +144,22 @@ def _list_devices_windows() -> list[CameraInfo]:
     Handles two ffmpeg output formats:
     - Old (ffmpeg <7): ``[dshow @ ...] DirectShow video devices`` section header
     - New (ffmpeg 8+): ``[in#0 @ ...] "Camera Name" (video)`` flat list
+
+    Tries two argument orders so both old and new ffmpeg builds work:
+    1. ffmpeg 7+  treats ``-list_devices`` as a *generic* option (before ``-f``)
+    2. ffmpeg <7 requires the *format-specific* position (after ``-f dshow``)
     """
+    # ffmpeg 7+: generic option before -f
     output = _run_ffmpeg(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
 
+    # Fallback for older ffmpeg: format-specific option after -f dshow
     if not output.strip():
-        logger.warning("ffmpeg -list_devices returned empty output")
+        logger.debug("generic -list_devices returned empty, trying format-specific")
+        output = _run_ffmpeg(["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+
+    if not output.strip():
+        logger.warning("ffmpeg -list_devices returned empty output "
+                       "(both argument orders tried)")
         return []
 
     logger.debug("dshow device listing output:\n%s", output)
@@ -172,9 +192,14 @@ def _list_devices_windows() -> list[CameraInfo]:
         if match:
             name = match.group(1)
             idx = len(cameras)
+            # NOTE: no shell quotes — subprocess passes each list element
+            # as a single argv entry, so ``video=Integrated Camera`` is
+            # already one argument.  Literal ``"`` chars would be passed
+            # to ffmpeg and treated as part of the device name, causing
+            # "Could not find video device with name ["Camera"]".
             cameras.append(CameraInfo(
                 index=idx, name=name,
-                platform_id=f'video="{name}"',
+                platform_id=f'video={name}',
             ))
 
     logger.info("Found %d dshow camera(s)", len(cameras))
@@ -236,11 +261,18 @@ def _probe_capability(platform_id: str, width: int, height: int,
     return success
 
 
-def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int]]:
-    """Query supported resolutions & framerates via ``-list_options true``.
+# Compressed codecs that can be stream-copied into MP4 without re-encoding.
+_PASSTHROUGH_CODECS = frozenset({"mjpeg", "h264", "hevc"})
+
+
+def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int], str]:
+    """Query supported resolutions, framerates & native codec via ``-list_options``.
 
     Much faster than probing — ffmpeg directly enumerates the dshow pin caps.
-    Returns (resolutions, framerates).
+    Returns (resolutions, framerates, native_codec).
+
+    *native_codec* is the camera's preferred compressed output (e.g. ``"mjpeg"``),
+    or a raw pixel format (``"yuyv422"``), or ``""`` if parsing failed.
     """
     output = _run_ffmpeg(
         ["-f", "dshow", "-list_options", "true", "-i", platform_id],
@@ -249,41 +281,72 @@ def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[i
 
     resolutions: set[tuple[int, int]] = set()
     framerates: set[int] = set()
+    vcodecs: set[str] = set()
+    pixel_formats: set[str] = set()
 
     # Parse lines like:
-    #   pixel_format=mjpeg  min s=320x240 fps=15 max s=1920x1080 fps=30
+    #   vcodec=mjpeg  min s=320x240 fps=15 max s=1920x1080 fps=30
     #   pixel_format=yuyv422 min s=640x480 fps=30 max s=640x480 fps=30
+    # fps may be integer ("30") or decimal ("30.00") depending on ffmpeg build
     for line in output.splitlines():
+        # Capture the prefix: vcodec=XXX or pixel_format=XXX
+        codec_match = re.search(r'\b(vcodec|pixel_format)=(\S+)', line)
+        if codec_match:
+            kind, value = codec_match.group(1), codec_match.group(2)
+            if kind == "vcodec":
+                vcodecs.add(value)
+            else:
+                pixel_formats.add(value)
+
         # Look for max resolution/fps at the end of capability lines
-        match = re.search(r'max\s+s=(\d+)x(\d+)\s+fps=(\d+)', line)
+        match = re.search(r'max\s+s=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)', line)
         if match:
-            w, h, fps = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            w, h = int(match.group(1)), int(match.group(2))
+            fps = int(float(match.group(3)))
             resolutions.add((w, h))
             framerates.add(fps)
-        # Some lines have only one resolution (min == max omitted)
-        match = re.search(r's=(\d+)x(\d+)\s+fps=(\d+)', line)
+        # Some lines have only one resolution (min == max omitted);
+        # also matches the *min* values from min-max lines (broadens coverage)
+        match = re.search(r's=(\d+)x(\d+)\s+fps=(\d+(?:\.\d+)?)', line)
         if match:
-            w, h, fps = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            w, h = int(match.group(1)), int(match.group(2))
+            fps = int(float(match.group(3)))
             resolutions.add((w, h))
             framerates.add(fps)
+
+    # Prefer compressed vcodecs (passthrough-capable), then raw pixel formats
+    native_codec = ""
+    if vcodecs:
+        # Pick the first compressed codec we know how to passthrough
+        for c in sorted(vcodecs):
+            if c in _PASSTHROUGH_CODECS:
+                native_codec = c
+                break
+        if not native_codec:
+            native_codec = sorted(vcodecs)[0]
+    elif pixel_formats:
+        native_codec = sorted(pixel_formats)[0]
 
     res_list = sorted(resolutions, key=lambda r: (-r[0], -r[1]))  # highest first
     fps_list = sorted(framerates, reverse=True)
-    logger.info("dshow caps for %s: res=%s fps=%s", platform_id, res_list, fps_list)
-    return res_list, fps_list
+    logger.info("dshow caps for %s: res=%s fps=%s native=%s",
+                platform_id, res_list, fps_list, native_codec)
+    return res_list, fps_list, native_codec
 
 
 def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     """Probe which resolutions/framerates the camera supports.
 
-    On Windows, uses the fast ``-list_options`` path.
+    On Windows, uses the fast ``-list_options`` path which also captures
+    the camera's native output codec (e.g. ``mjpeg``) for passthrough recording.
     On macOS/Linux, falls back to probe-each-combo (slower but works).
     """
     if platform_name == "Windows":
-        res, fps = _query_caps_windows(camera.platform_id)
+        res, fps, native = _query_caps_windows(camera.platform_id)
         if res:
             camera.supported_resolutions = res
             camera.supported_framerates = fps
+            camera.native_codec = native
             return
         # Fall through to probing if list_options gave nothing
         logger.warning("_query_caps_windows empty, falling back to probing")

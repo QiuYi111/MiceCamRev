@@ -14,6 +14,8 @@ from micecam.camera_manager import (
     EncoderInfo,
     _list_devices_darwin,
     _list_devices_windows,
+    _query_caps_windows,
+    _run_ffmpeg,
     get_preferred_encoder,
 )
 
@@ -55,6 +57,47 @@ Encoders:
  V..... hevc_videotoolbox    VideoToolbox H.265 Encoder (codec hevc)
 """
 
+# Sample -list_options true output with integer fps values
+SAMPLE_LIST_OPTIONS_OUTPUT = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   pixel_format=mjpeg  min s=320x240 fps=15 max s=1920x1080 fps=30
+[dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422 min s=640x480 fps=30 max s=640x480 fps=30
+"""
+
+# Sample with decimal fps values (some ffmpeg builds)
+SAMPLE_LIST_OPTIONS_DECIMAL_FPS = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   pixel_format=mjpeg  min s=320x240 fps=15.00 max s=1920x1080 fps=30.00
+[dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422 min s=160x120 fps=10.00 max s=640x480 fps=30.00
+"""
+
+# Single-resolution mode line (no separate min/max)
+SAMPLE_LIST_OPTIONS_SINGLE = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422  s=640x480 fps=30
+"""
+
+# Real-world output with vcodec=mjpeg (hardware-compressed, passthrough-capable)
+SAMPLE_LIST_OPTIONS_VCODEC = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720 fps=30
+[dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=320x240 fps=30 max s=320x240 fps=30
+[dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422  min s=640x480 fps=30 max s=640x480 fps=30
+"""
+
+# Camera with no compressed codec, only raw pixel formats
+SAMPLE_LIST_OPTIONS_RAW_ONLY = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422  min s=640x480 fps=30 max s=640x480 fps=30
+[dshow @ 0000021b8a9e2c00]   pixel_format=nv12  min s=320x240 fps=30 max s=320x240 fps=30
+"""
+
 
 class TestDarwinDeviceListing:
     def test_parse_avfoundation_devices(self) -> None:
@@ -90,7 +133,7 @@ class TestWindowsDeviceListing:
 
         assert len(cameras) == 2
         assert cameras[0].name == "Logitech HD Webcam C920"
-        assert cameras[0].platform_id == 'video="Logitech HD Webcam C920"'
+        assert cameras[0].platform_id == 'video=Logitech HD Webcam C920'
         assert cameras[1].name == "Integrated Camera"
 
     def test_no_cameras(self) -> None:
@@ -111,7 +154,7 @@ class TestWindowsDeviceListing:
 
         assert len(cameras) == 1
         assert cameras[0].name == "Integrated Camera"
-        assert cameras[0].platform_id == 'video="Integrated Camera"'
+        assert cameras[0].platform_id == 'video=Integrated Camera'
 
     def test_v8_skips_alternative_names(self) -> None:
         """Alternative name lines must not create duplicate entries."""
@@ -181,3 +224,150 @@ class TestEncoderPreference:
         ):
             encoder = get_preferred_encoder("h264")
             assert encoder == "h264_videotoolbox"
+
+
+class TestListDevicesFallback:
+    """Verify -list_devices argument-order fallback behaviour."""
+
+    def test_generic_succeeds_no_fallback(self) -> None:
+        """When generic style (ffmpeg 7+) returns data, don't try fallback."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+        ) as mock_run:
+            mock_run.return_value = SAMPLE_DSHOW_OUTPUT
+            cameras = _list_devices_windows()
+
+        assert len(cameras) == 2
+        # Only one call — generic style succeeded
+        assert mock_run.call_count == 1
+        # First call uses generic option ordering
+        first_call_args = mock_run.call_args_list[0][0][0]
+        assert first_call_args[0] == "-list_devices"
+
+    def test_fallback_to_format_specific(self) -> None:
+        """When generic style returns empty, try format-specific style."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+        ) as mock_run:
+            # First call (generic) → empty, second (format-specific) → success
+            mock_run.side_effect = ["", SAMPLE_DSHOW_OUTPUT]
+            cameras = _list_devices_windows()
+
+        assert len(cameras) == 2
+        assert mock_run.call_count == 2
+        # Second call uses format-specific ordering
+        second_call_args = mock_run.call_args_list[1][0][0]
+        assert second_call_args[0] == "-f"
+        assert second_call_args[1] == "dshow"
+
+    def test_both_fail_returns_empty(self) -> None:
+        """When both styles fail, return empty list."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            side_effect=["", ""],  # generic empty → format-specific empty
+        ):
+            cameras = _list_devices_windows()
+        assert cameras == []
+
+
+class TestQueryCapsWindows:
+    """Verify -list_options output parsing, including native codec."""
+
+    def test_parse_integer_fps(self) -> None:
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_OUTPUT,
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+
+        assert (1920, 1080) in res
+        assert (640, 480) in res
+        assert (320, 240) in res  # min resolution, captured by second regex
+        assert 30 in fps
+        assert 15 in fps  # min fps
+        # Highest resolution first
+        assert res[0] == (1920, 1080)
+        # pixel_format=mjpeg is preferred (first compressed codec)
+        assert native == "mjpeg"
+
+    def test_parse_decimal_fps(self) -> None:
+        """Decimal fps values like 30.00 must be parsed as int 30."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_DECIMAL_FPS,
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+
+        assert (1920, 1080) in res
+        assert (640, 480) in res
+        assert 30 in fps  # 30.00 → 30
+        assert 15 in fps  # 15.00 → 15
+        assert 10 in fps  # 10.00 → 10
+        # No float values should leak through
+        assert all(isinstance(f, int) for f in fps)
+        assert native == "mjpeg"
+
+    def test_parse_single_resolution(self) -> None:
+        """Devices with only one resolution (no min/max split)."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_SINGLE,
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+
+        assert res == [(640, 480)]
+        assert fps == [30]
+        assert native == "yuyv422"
+
+    def test_empty_output(self) -> None:
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value="",
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+        assert res == []
+        assert fps == []
+        assert native == ""
+
+    def test_vcodec_mjpeg_parsing(self) -> None:
+        """vcodec=mjpeg (hardware-compressed) → native_codec = 'mjpeg'."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_VCODEC,
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+
+        assert (1280, 720) in res
+        assert (640, 480) in res
+        assert (320, 240) in res
+        assert fps == [30]
+        # vcodec=mjpeg takes priority over pixel_format=yuyv422
+        assert native == "mjpeg"
+
+    def test_raw_only_no_passthrough(self) -> None:
+        """Camera with only raw pixel formats — no passthrough codec."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_RAW_ONLY,
+        ):
+            res, fps, native = _query_caps_windows('video=Test')
+
+        assert (640, 480) in res
+        assert (320, 240) in res
+        assert native == "nv12"  # alphabetically first raw format
+
+
+class TestRunFfmpegEncoding:
+    """Verify _run_ffmpeg passes UTF-8 encoding to subprocess."""
+
+    def test_uses_utf8_encoding(self) -> None:
+        """subprocess.run must be called with encoding='utf-8'."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value.stderr = "test output"
+            mock_run.return_value.stdout = ""
+            _run_ffmpeg(["-version"], timeout=5)
+
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        assert kwargs.get("text") is True

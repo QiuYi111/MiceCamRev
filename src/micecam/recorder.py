@@ -38,10 +38,15 @@ class Recorder:
     frame number and elapsed steady-clock nanoseconds since recording began.
     """
 
+    # Compressed codecs that can be stream-copied to MP4 without re-encoding.
+    _PASSTHROUGH_CODECS = frozenset({"mjpeg", "h264", "hevc"})
+
     def __init__(self, camera_id: str, camera_name: str = "",
-                 output_dir: Path = Path("./output")) -> None:
+                 output_dir: Path = Path("./output"),
+                 native_codec: str = "") -> None:
         self.camera_id = camera_id          # platform-specific device id
         self.camera_name = camera_name       # human-readable label
+        self.native_codec = native_codec     # camera's native output (e.g. "mjpeg")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -90,11 +95,17 @@ class Recorder:
         ts_writer.start(wall_start=wall_start, steady_start=steady_start)
         self._ts_writer = ts_writer
 
-        encoder = get_preferred_encoder(codec)
-        logger.info("Using encoder: %s for codec %s", encoder, codec)
+        use_passthrough = self.native_codec in self._PASSTHROUGH_CODECS
+        if use_passthrough:
+            logger.info("Using native %s passthrough — no re-encode",
+                        self.native_codec)
+        else:
+            encoder = get_preferred_encoder(codec)
+            logger.info("Using encoder: %s for codec %s", encoder, codec)
 
         cmd = self._build_command(
-            resolution=resolution, fps=fps, encoder=encoder,
+            resolution=resolution, fps=fps,
+            encoder="copy" if use_passthrough else encoder,
             output_path=self._output_path,
         )
         logger.debug("ffmpeg command: %s", " ".join(cmd))
@@ -184,10 +195,16 @@ class Recorder:
 
     def _build_command(self, resolution: tuple[int, int], fps: int,
                        encoder: str, output_path: Path) -> list[str]:
-        """Assemble the ffmpeg command line."""
+        """Assemble the ffmpeg command line.
+
+        When *encoder* is ``"copy"`` the camera's native compressed stream
+        (e.g. MJPEG) is stream-copied to the MP4 container without decoding
+        or re-encoding, preserving the camera's true framerate.
+        """
         w, h = resolution
         system = sys.platform
         ffmpeg = get_ffmpeg_path()
+        is_passthrough = encoder == "copy"
 
         # Platform-specific input
         if system == "darwin":
@@ -199,13 +216,19 @@ class Recorder:
             ]
         elif system == "win32":
             # camera_id is already the full dshow device specifier
-            # e.g. 'video="Integrated Camera"'
+            # e.g. 'video=Integrated Camera' (NO shell quotes — subprocess list mode)
             input_args = [
                 "-f", "dshow",
+            ]
+            # When copying, request the camera's native codec explicitly
+            # (must come after -f dshow, before -framerate)
+            if is_passthrough and self.native_codec:
+                input_args.extend(["-vcodec", self.native_codec])
+            input_args.extend([
                 "-framerate", str(fps),
                 "-video_size", f"{w}x{h}",
                 "-i", self.camera_id,
-            ]
+            ])
         else:
             input_args = [
                 "-f", "v4l2",
@@ -214,8 +237,10 @@ class Recorder:
                 "-i", self.camera_id,
             ]
 
-        # Encoder args — VideoToolbox needs special pixel format
-        if "videotoolbox" in encoder:
+        # Codec args
+        if is_passthrough:
+            codec_args = ["-c:v", "copy"]
+        elif "videotoolbox" in encoder:
             codec_args = [
                 "-c:v", encoder,
                 "-allow_sw", "1",        # allow software fallback
@@ -238,14 +263,16 @@ class Recorder:
             ffmpeg, "-hide_banner", "-loglevel", "info",
             *input_args,
             *codec_args,
-            # Key frame every 2 seconds for seekability
-            "-g", str(fps * 2),
             # No audio (video-only from camera)
             "-an",
             # Overwrite output
             "-y",
-            str(output_path),
         ]
+        # Keyframe interval only for re-encoding; copy preserves original GOP
+        if not is_passthrough:
+            cmd.append("-g")
+            cmd.append(str(fps * 2))
+        cmd.append(str(output_path))
         return cmd
 
     def _read_stderr(self) -> None:

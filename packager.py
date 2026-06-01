@@ -22,11 +22,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
-# Platform-specific ffmpeg binary locations (relative to ROOT)
+# Platform-specific ffmpeg binary locations (relative to ROOT).
+# Must match the directory structure used by scripts/download_ffmpeg.py
+# and the runtime resolution in camera_manager.get_ffmpeg_path().
 FFMPEG_BUNDLE: dict[str, str] = {
-    "Darwin": "ffmpeg/macos/ffmpeg",
-    "Windows": "ffmpeg/windows/ffmpeg.exe",
-    "Linux": "ffmpeg/linux/ffmpeg",
+    "Darwin": "ffmpeg/ffmpeg",
+    "Windows": "ffmpeg/ffmpeg.exe",
+    "Linux": "ffmpeg/ffmpeg",
 }
 
 
@@ -36,13 +38,13 @@ def ensure_ffmpeg() -> Path:
     bundled = ROOT / FFMPEG_BUNDLE.get(system, "ffmpeg")
 
     if bundled.exists():
-        print(f"✓ Using bundled ffmpeg: {bundled}")
+        print(f"[OK] Using bundled ffmpeg: {bundled}")
         return bundled
 
     # Fall back to system ffmpeg
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
-        print(f"⚠ No bundled ffmpeg, using system: {system_ffmpeg}")
+        print(f"[WARN] No bundled ffmpeg, using system: {system_ffmpeg}")
         return Path(system_ffmpeg)
 
     print("ERROR: ffmpeg not found. Download a pre-compiled ffmpeg and place it at:")
@@ -52,23 +54,26 @@ def ensure_ffmpeg() -> Path:
 
 
 def clean_dist() -> None:
-    """Remove previous build artifacts."""
+    """Remove previous build artifacts (best-effort, skips locked files)."""
     for d in ["dist", "build"]:
         path = ROOT / d
         if path.exists():
-            shutil.rmtree(path)
-            print(f"✓ Cleaned {d}/")
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"[OK] Cleaned {d}/")
 
 
 def build_spec(ffmpeg_path: Path) -> str:
     """Generate PyInstaller .spec file content."""
+    # Use posix path to avoid backslash escape issues in the spec file
+    # (e.g. \f, \U in Windows paths become Python escape sequences)
+    binary_path = ffmpeg_path.as_posix()
     return f"""# -*- mode: python ; coding: utf-8 -*-
 # Auto-generated spec for MiceCam
 
 a = Analysis(
     ['src/micecam/main.py'],
     pathex=[],
-    binaries=[('{ffmpeg_path}', '.')],
+    binaries=[('{binary_path}', '.')],
     datas=[],
     hiddenimports=[
         'PyQt6.QtCore',
@@ -123,7 +128,7 @@ def main() -> None:
     dest = bundled_dir / ffmpeg_path.name
     if ffmpeg_path != dest:
         shutil.copy2(ffmpeg_path, dest)
-        print(f"✓ Copied ffmpeg to {dest}")
+        print(f"[OK] Copied ffmpeg to {dest}")
 
     # Write spec and run PyInstaller
     spec_content = build_spec(dest)

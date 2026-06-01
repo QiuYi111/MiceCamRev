@@ -108,7 +108,8 @@ def _run_smoke_test() -> int:
         cameras = list_cameras(probe_capabilities=False)
         check(f"list_cameras -> {len(cameras)} found", len(cameras) >= 0)
         for cam in cameras:
-            print(f"     [{cam.index}] {cam.name}")
+            native = f"  native={cam.native_codec}" if cam.native_codec else ""
+            print(f"     [{cam.index}] {cam.name}{native}")
     except Exception as e:
         check("list_cameras", False, str(e))
 

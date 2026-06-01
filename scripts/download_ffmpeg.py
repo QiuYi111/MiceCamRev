@@ -29,7 +29,7 @@ BUNDLE_DIR = PROJECT_ROOT / "ffmpeg"
 def download_with_progress(url: str, dest: Path) -> None:
     """Download a file with a simple progress indicator."""
     print(f"Downloading {url}")
-    print(f"  → {dest}")
+    print(f"  -> {dest}")
 
     def _report(block_num: int, block_size: int, total_size: int) -> None:
         downloaded = block_num * block_size
@@ -59,7 +59,7 @@ def extract_ffmpeg(zip_path: Path) -> Path | None:
                 dest = BUNDLE_DIR / "ffmpeg.exe"
                 dest.write_bytes(data)
                 dest.chmod(0o755)
-                print(f"  Extracted → {dest} ({len(data):,} bytes)")
+                print(f"  Extracted -> {dest} ({len(data):,} bytes)")
                 return dest
 
     print("ERROR: ffmpeg.exe not found in the zip archive.")
@@ -80,6 +80,7 @@ def main() -> int:
         )
         print("  On macOS/Linux, local ffmpeg is used for development.")
 
+    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = BUNDLE_DIR / "ffmpeg-win64.zip"
 
     try:

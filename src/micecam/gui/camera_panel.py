@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # Preview dimensions (kept low to avoid taxing the camera / USB bus)
 PREVIEW_W = 640
 PREVIEW_H = 480
-PREVIEW_FPS = 15
 
 
 # ── Preview capture thread ──────────────────────────────────────────
@@ -46,9 +45,11 @@ class PreviewThread(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(QtGui.QImage)
     preview_error = QtCore.pyqtSignal(str)
 
-    def __init__(self, camera_id: str, parent: Optional[QtCore.QObject] = None):
+    def __init__(self, camera_id: str, fps: int = 30,
+                 parent: Optional[QtCore.QObject] = None):
         super().__init__(parent)
         self.camera_id = camera_id
+        self.fps = fps
         self._running = False
         self._process: Optional[subprocess.Popen] = None
 
@@ -60,23 +61,23 @@ class PreviewThread(QtCore.QThread):
         if system == "darwin":
             input_args = [
                 "-f", "avfoundation",
-                "-framerate", str(PREVIEW_FPS),
+                "-framerate", str(self.fps),
                 "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
                 "-i", self.camera_id,
             ]
         elif system == "win32":
             # camera_id is already the full dshow device specifier
-            # e.g. 'video="Integrated Camera"'
+            # e.g. 'video=Integrated Camera' (NO shell quotes — subprocess list mode)
             input_args = [
                 "-f", "dshow",
-                "-framerate", str(PREVIEW_FPS),
+                "-framerate", str(self.fps),
                 "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
                 "-i", self.camera_id,
             ]
         else:
             input_args = [
                 "-f", "v4l2",
-                "-framerate", str(PREVIEW_FPS),
+                "-framerate", str(self.fps),
                 "-video_size", f"{PREVIEW_W}x{PREVIEW_H}",
                 "-i", self.camera_id,
             ]
@@ -305,7 +306,9 @@ class CameraPanel(QtWidgets.QGroupBox):
 
     def _start_preview(self, cam: CameraInfo) -> None:
         self._stop_preview()
-        self._preview_thread = PreviewThread(cam.platform_id, self)
+        # Use the camera's actual supported framerate (highest first in list)
+        fps = cam.supported_framerates[0] if cam.supported_framerates else 30
+        self._preview_thread = PreviewThread(cam.platform_id, fps=fps, parent=self)
         self._preview_thread.frame_ready.connect(self._on_frame)
         self._preview_thread.preview_error.connect(self._on_preview_error)
         self._preview_thread.start()
@@ -362,6 +365,7 @@ class CameraPanel(QtWidgets.QGroupBox):
             camera_id=cam.platform_id,
             camera_name=cam.name,
             output_dir=output_dir,
+            native_codec=cam.native_codec,
         )
 
     def get_config(self) -> dict:
