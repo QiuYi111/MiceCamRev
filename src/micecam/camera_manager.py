@@ -102,8 +102,8 @@ def _run_ffmpeg(args: list[str], timeout: float = 10) -> str:
 
 def _list_devices_darwin() -> list[CameraInfo]:
     """List AVFoundation cameras on macOS."""
-    # ffmpeg 8.0+: -list_devices true (string), -i "" (empty input)
-    output = _run_ffmpeg(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+    # -list_devices must come before -f (generic option, not format-specific)
+    output = _run_ffmpeg(["-list_devices", "true", "-f", "avfoundation", "-i", ""])
 
     cameras: list[CameraInfo] = []
     in_video_section = False
@@ -130,19 +130,48 @@ def _list_devices_darwin() -> list[CameraInfo]:
 
 
 def _list_devices_windows() -> list[CameraInfo]:
-    """List dshow cameras on Windows."""
-    output = _run_ffmpeg(["-f", "dshow", "-list_devices", "true", "-i", "dummy"])
+    """List dshow cameras on Windows.
+
+    Uses ``-list_devices true`` (ffmpeg 7+) to enumerate video sources.
+    The flag must come *before* ``-f dshow`` so ffmpeg treats it as a
+    generic option, not a dshow-specific one.
+    """
+    output = _run_ffmpeg(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+
+    if not output.strip():
+        logger.warning("ffmpeg -list_devices returned empty output")
+        return []
+
+    logger.debug("dshow device listing output:\n%s", output)
+
     cameras: list[CameraInfo] = []
+    in_video_section = False
     for line in output.splitlines():
-        # Parse: [dshow @ ...] "Logitech Webcam" (video)
-        match = re.search(r'"(.+?)"\s*\(video\)', line)
-        if match:
-            name = match.group(1)
-            idx = len(cameras)
-            cameras.append(CameraInfo(
-                index=idx, name=name,
-                platform_id=f'video="{name}"',
-            ))
+        line = line.strip()
+        # Detect section boundaries
+        if "DirectShow video devices" in line:
+            in_video_section = True
+            continue
+        if "DirectShow audio devices" in line:
+            break
+
+        if in_video_section:
+            # Try two patterns:
+            # 1. "Camera Name" (video)   ← standard dshow output
+            # 2. Alternative: [dshow @ ...]  "Camera Name"
+            match = re.search(r'"(.+?)"\s*\(video\)', line)
+            if not match:
+                # Try alternative: quoted name anywhere in the line
+                match = re.search(r'"([^"]+)"', line)
+            if match:
+                name = match.group(1)
+                idx = len(cameras)
+                cameras.append(CameraInfo(
+                    index=idx, name=name,
+                    platform_id=f'video="{name}"',
+                ))
+
+    logger.info("Found %d dshow camera(s)", len(cameras))
     return cameras
 
 
@@ -166,7 +195,10 @@ def _list_devices_linux() -> list[CameraInfo]:
 
 def _probe_capability(platform_id: str, width: int, height: int,
                       fps: int, platform_name: str) -> bool:
-    """Test whether a camera supports a given resolution/fps combo."""
+    """Test whether a camera supports a given resolution/fps combo.
+
+    Prefer ``_query_caps_windows`` on Windows — this is a slow fallback.
+    """
     if platform_name == "Darwin":
         args = [
             "-f", "avfoundation",
@@ -192,25 +224,73 @@ def _probe_capability(platform_id: str, width: int, height: int,
             "-vframes", "1", "-f", "null", "-"
         ]
     output = _run_ffmpeg(args, timeout=8)
-    # If ffmpeg succeeds, there's no "Error" in output
     success = "Error" not in output and "Invalid" not in output
     logger.debug("Probe %s %dx%d@%d → %s", platform_id, width, height, fps,
                  "OK" if success else "FAIL")
     return success
 
 
+def _query_caps_windows(platform_id: str) -> tuple[list[tuple[int, int]], list[int]]:
+    """Query supported resolutions & framerates via ``-list_options true``.
+
+    Much faster than probing — ffmpeg directly enumerates the dshow pin caps.
+    Returns (resolutions, framerates).
+    """
+    output = _run_ffmpeg(
+        ["-f", "dshow", "-list_options", "true", "-i", platform_id],
+        timeout=10,
+    )
+
+    resolutions: set[tuple[int, int]] = set()
+    framerates: set[int] = set()
+
+    # Parse lines like:
+    #   pixel_format=mjpeg  min s=320x240 fps=15 max s=1920x1080 fps=30
+    #   pixel_format=yuyv422 min s=640x480 fps=30 max s=640x480 fps=30
+    for line in output.splitlines():
+        # Look for max resolution/fps at the end of capability lines
+        match = re.search(r'max\s+s=(\d+)x(\d+)\s+fps=(\d+)', line)
+        if match:
+            w, h, fps = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            resolutions.add((w, h))
+            framerates.add(fps)
+        # Some lines have only one resolution (min == max omitted)
+        match = re.search(r's=(\d+)x(\d+)\s+fps=(\d+)', line)
+        if match:
+            w, h, fps = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            resolutions.add((w, h))
+            framerates.add(fps)
+
+    res_list = sorted(resolutions, key=lambda r: (-r[0], -r[1]))  # highest first
+    fps_list = sorted(framerates, reverse=True)
+    logger.info("dshow caps for %s: res=%s fps=%s", platform_id, res_list, fps_list)
+    return res_list, fps_list
+
+
 def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
-    """Probe which resolutions/framerates the camera supports."""
+    """Probe which resolutions/framerates the camera supports.
+
+    On Windows, uses the fast ``-list_options`` path.
+    On macOS/Linux, falls back to probe-each-combo (slower but works).
+    """
+    if platform_name == "Windows":
+        res, fps = _query_caps_windows(camera.platform_id)
+        if res:
+            camera.supported_resolutions = res
+            camera.supported_framerates = fps
+            return
+        # Fall through to probing if list_options gave nothing
+        logger.warning("_query_caps_windows empty, falling back to probing")
+
+    # Slow path: probe each common resolution/fps combo
     supported_res = []
     for w, h in COMMON_RESOLUTIONS:
         if _probe_capability(camera.platform_id, w, h, 30, platform_name):
             supported_res.append((w, h))
     if not supported_res:
-        # If none worked, assume 640x480 as minimum fallback
         supported_res = [(640, 480)]
 
     supported_fps = []
-    # Use the highest supported resolution for fps probing
     test_res = supported_res[0]
     for fps in COMMON_FRAMERATES:
         if _probe_capability(camera.platform_id, test_res[0], test_res[1],
