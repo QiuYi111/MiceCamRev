@@ -129,21 +129,21 @@ class TestTimestampWriter:
         assert "# timing_model: uniform_estimate_over_monotonic_duration" in content
         assert "# timestamp_source: recorder_monotonic_clock" in content
 
-    def test_finalize_absolute_times_uses_per_frame_timestamps(
+    def test_finalize_pts_times_uses_per_frame_timestamps(
         self, tmp_path: Path
     ) -> None:
         """Per-frame ffmpeg timestamps should be written without averaging."""
         srt_path = tmp_path / "test.srt"
         tw = TimestampWriter(srt_path)
         tw.start(wall_start=1717171200.0, steady_start=1_000_000_000)
-        tw.finalize_absolute_times([
-            1717171200.100,
-            1717171200.150,
-            1717171200.260,
-        ])
+        tw.finalize_pts_times([12.100, 12.150, 12.260])
 
         content = srt_path.read_text()
-        assert "# timing_model: per_frame_ffmpeg_demuxer_wallclock_pts" in content
+        assert "# timing_model: per_frame_native_pts" in content
+        assert "# timestamp_source: ffmpeg_demuxer_pkt_pts_time" in content
+        assert "# wall_mapping: wall_start + (pts - first_pts)" in content
         assert "00:00:00,000 --> 00:00:00,050" in content
         assert "00:00:00,050 --> 00:00:00,160" in content
+        assert "pts=12.100000000" in content
+        assert "pts_offset=0.050000000" in content
         assert "frame=3" in content

@@ -117,20 +117,20 @@ frame=  495 fps=0.0 q=-1.0 Lsize=N/A time=00:00:16.59 bitrate=N/A speed= 341x
         assert metadata["diagnostics"]["duration_delta_seconds"] == pytest.approx(5.37)
         assert metadata["diagnostics"]["warnings"]
 
-    def test_record_frame_timestamp_keeps_absolute_wallclock_pts(self) -> None:
+    def test_record_frame_timestamp_keeps_native_pts(self) -> None:
         recorder = Recorder(camera_id="video=Test")
-        recorder._record_frame_timestamp(
-            "[vist#0:0/mjpeg] demuxer -> ist_index:0:0 type:video "
-            "pkt_pts:1717171200123456 pkt_pts_time:1717171200.123456"
-        )
         recorder._record_frame_timestamp(
             "[vist#0:0/mjpeg] demuxer -> ist_index:0:0 type:video "
             "pkt_pts:333333 pkt_pts_time:0.0333333"
         )
+        recorder._record_frame_timestamp(
+            "[vist#0:0/mjpeg] demuxer -> ist_index:0:0 type:video "
+            "pkt_pts:666666 pkt_pts_time:0.0666666"
+        )
 
-        assert recorder._frame_wall_times == [1717171200.123456]
+        assert recorder._frame_pts_times == [0.0333333, 0.0666666]
 
-    def test_build_command_requests_wallclock_debug_timestamps(
+    def test_build_command_uses_native_dshow_pts_on_windows(
         self, tmp_path: Path
     ) -> None:
         recorder = Recorder(camera_id="video=Test", native_codec="mjpeg")
@@ -143,10 +143,7 @@ frame=  495 fps=0.0 q=-1.0 Lsize=N/A time=00:00:16.59 bitrate=N/A speed= 341x
             )
 
         assert "-debug_ts" in cmd
-        wallclock_index = cmd.index("-use_wallclock_as_timestamps")
-        input_index = cmd.index("-i")
-        assert cmd[wallclock_index + 1] == "1"
-        assert wallclock_index < input_index
+        assert "-use_wallclock_as_timestamps" not in cmd
 
     def test_build_command_uses_dshow_device_number(self, tmp_path: Path) -> None:
         recorder = Recorder(

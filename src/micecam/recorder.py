@@ -68,7 +68,7 @@ class Recorder:
         # Progress tracking
         self.duration_seconds: float = 0.0
         self.frame_count: int = 0
-        self._frame_wall_times: list[float] = []
+        self._frame_pts_times: list[float] = []
         self._requested_resolution: tuple[int, int] | None = None
         self._requested_fps: int | None = None
         self._requested_codec: str = ""
@@ -108,7 +108,7 @@ class Recorder:
         self._requested_resolution = resolution
         self._requested_fps = fps
         self._requested_codec = codec
-        self._frame_wall_times = []
+        self._frame_pts_times = []
         self._failure_reason = None
         self._stderr_tail = []
         self._stderr_error_lines = []
@@ -252,13 +252,13 @@ class Recorder:
         wall_duration = stop_request_time - self._start_time
         progress_frames = self.frame_count
         video_duration, video_frames = self._probe_output_video()
-        if self._frame_wall_times:
+        if self._frame_pts_times:
             self.duration_seconds = (
-                self._frame_wall_times[-1] - self._frame_wall_times[0]
+                self._frame_pts_times[-1] - self._frame_pts_times[0]
             )
-            self.frame_count = len(self._frame_wall_times)
+            self.frame_count = len(self._frame_pts_times)
         else:
-            self.duration_seconds = wall_duration
+            self.duration_seconds = video_duration or wall_duration
             if video_frames is not None:
                 self.frame_count = video_frames
 
@@ -276,8 +276,8 @@ class Recorder:
 
         # Finalize SRT timestamps
         if self._ts_writer:
-            if self._frame_wall_times:
-                self._ts_writer.finalize_absolute_times(self._frame_wall_times)
+            if self._frame_pts_times:
+                self._ts_writer.finalize_pts_times(self._frame_pts_times)
             else:
                 self._ts_writer.finalize(self.duration_seconds, self.frame_count)
             self._ts_writer = None
@@ -356,7 +356,6 @@ class Recorder:
             # e.g. 'video=Integrated Camera' (NO shell quotes — subprocess list mode)
             input_args = [
                 "-f", "dshow",
-                "-use_wallclock_as_timestamps", "1",
                 *(
                     ["-video_device_number", str(self.camera_device_number)]
                     if self.camera_device_number is not None else []
@@ -548,7 +547,7 @@ class Recorder:
                 pass
 
     def _record_frame_timestamp(self, line: str) -> None:
-        """Capture per-frame wall-clock timestamps emitted by ffmpeg debug_ts."""
+        """Capture per-frame native PTS timestamps emitted by ffmpeg debug_ts."""
         match = re.search(r"\bpkt_pts_time:([+-]?\d+(?:\.\d+)?)", line)
         if not match:
             return
@@ -556,14 +555,9 @@ class Recorder:
             pts_time = float(match.group(1))
         except ValueError:
             return
-        # With -use_wallclock_as_timestamps this should be POSIX epoch time.
-        # Ignore normalized/container-relative values; they are not absolute
-        # experimental timestamps.
-        if pts_time < 946684800.0:  # 2000-01-01 UTC
+        if self._frame_pts_times and pts_time <= self._frame_pts_times[-1]:
             return
-        if self._frame_wall_times and pts_time <= self._frame_wall_times[-1]:
-            return
-        self._frame_wall_times.append(pts_time)
+        self._frame_pts_times.append(pts_time)
 
     def _probe_output_video(self) -> tuple[float | None, int | None]:
         """Return final MP4 duration and video packet count when available."""
@@ -633,14 +627,19 @@ class Recorder:
             return
 
         frame_count = self.frame_count
-        real_fps = frame_count / wall_duration if wall_duration > 0 else None
+        experimental_duration = self.duration_seconds or wall_duration
+        real_fps = (
+            frame_count / experimental_duration
+            if experimental_duration > 0
+            else None
+        )
         container_fps = (
             video_frames / video_duration
             if video_duration and video_frames
             else None
         )
         duration_delta = (
-            wall_duration - video_duration
+            experimental_duration - video_duration
             if video_duration is not None
             else None
         )
@@ -652,8 +651,8 @@ class Recorder:
             )
         if duration_delta is not None and abs(duration_delta) > 0.5:
             warnings.append(
-                "container duration differs from monotonic recording duration; "
-                "SRT uses monotonic experimental time"
+                "container duration differs from experimental timing duration; "
+                "SRT uses experimental timing"
             )
 
         metadata = {
@@ -675,24 +674,23 @@ class Recorder:
             },
             "experimental_timing": {
                 "source": (
-                    "ffmpeg_demuxer_wallclock_pts"
-                    if self._frame_wall_times
+                    "ffmpeg_demuxer_pkt_pts_time"
+                    if self._frame_pts_times
                     else "monotonic_clock"
                 ),
-                "duration_seconds": wall_duration,
+                "duration_seconds": experimental_duration,
                 "frame_count": frame_count,
                 "ffmpeg_progress_frame_count": progress_frames,
                 "mean_fps": real_fps,
                 "frame_timestamps": (
                     "per_frame"
-                    if self._frame_wall_times
+                    if self._frame_pts_times
                     else "uniform_estimate_over_monotonic_duration"
                 ),
                 "note": (
-                    "SRT timestamps use ffmpeg demuxer packet wallclock PTS "
-                    "when available; otherwise they fall back to recorder "
-                    "monotonic-clock duration. They are not overwritten by "
-                    "MP4 container timing."
+                    "SRT timestamps use ffmpeg demuxer packet PTS when "
+                    "available. wall_start in the SRT header provides the "
+                    "absolute-time anchor."
                 ),
             },
             "container_timing": {
