@@ -12,14 +12,15 @@ import pytest
 from micecam.camera_manager import (
     CameraInfo,
     EncoderInfo,
-    _dshow_alt_from_registry_child,
-    _dshow_unique_name_from_display_name,
+    _extract_com_instance_sort_key,
     _list_devices_darwin,
     _list_devices_windows,
     _list_devices_windows_com,
     _list_devices_windows_pnp,
     _query_caps_windows,
+    _reorder_by_com_stable_order,
     _run_ffmpeg,
+    _suffix_duplicate_camera_names,
     choose_camera_input_codec,
     get_preferred_encoder,
 )
@@ -159,26 +160,24 @@ class TestWindowsDeviceListing:
         assert cameras == []
 
     def test_parse_v8_flat_format(self) -> None:
-        """ffmpeg 8+ output: uses unique Alternative name as platform_id."""
+        """ffmpeg 8+ output: uses friendly name (not Alternative name) as platform_id.
+
+        Alternative names are logged for diagnostics but not used as device
+        identifiers — they can pass ``-list_options`` yet fail during actual
+        streaming capture.
+        """
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_DSHOW_OUTPUT_V8,
-        ), mock.patch(
-            "micecam.camera_manager._dshow_device_id_usable",
-            return_value=True,
         ):
             cameras = _list_devices_windows()
 
         assert len(cameras) == 1
         assert cameras[0].name == "Integrated Camera"
-        # Alternative name is used as the unique platform_id
-        assert cameras[0].platform_id == (
-            'video=@device_pnp_\\\\?\\usb#vid_5986&pid_115f&mi_00'
-            '#7&18f24fa2&1&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global'
-        )
+        assert cameras[0].platform_id == "video=Integrated Camera"
 
-    def test_v8_uses_alternative_name_as_platform_id(self) -> None:
-        """Alternative name → unique platform_id; still one camera entry."""
+    def test_v8_uses_friendly_name_not_alternative_name(self) -> None:
+        """Alternative name is recorded for logging but platform_id stays friendly."""
         output = """
 [in#0 @ 0000023be5915d00] "My Webcam" (video)
 [in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#..."
@@ -186,14 +185,11 @@ class TestWindowsDeviceListing:
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
             return_value=output,
-        ), mock.patch(
-            "micecam.camera_manager._dshow_device_id_usable",
-            return_value=True,
         ):
             cameras = _list_devices_windows()
         assert len(cameras) == 1
         assert cameras[0].name == "My Webcam"
-        assert cameras[0].platform_id == 'video=@device_pnp_\\\\?\\usb#...'
+        assert cameras[0].platform_id == "video=My Webcam"
 
     def test_v8_skips_audio_devices(self) -> None:
         """Audio devices with (audio) suffix must not appear."""
@@ -209,8 +205,8 @@ class TestWindowsDeviceListing:
         assert len(cameras) == 1
         assert cameras[0].name == "Integrated Camera"
 
-    def test_duplicate_names_without_alternative_use_device_numbers(self) -> None:
-        """Old dshow output has no hardware path; use device_number fallback."""
+    def test_duplicate_names_use_friendly_names_and_device_numbers(self) -> None:
+        """Same-name cameras get device_number ordinals for disambiguation."""
         output = """
 [dshow @ 0000021b8a9e2c00] DirectShow video devices
 [dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
@@ -219,7 +215,7 @@ class TestWindowsDeviceListing:
 """
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
+            mock.patch("micecam.camera_manager._enumerate_dshow_video_monikers_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
@@ -231,83 +227,49 @@ class TestWindowsDeviceListing:
         ]
         assert [c.device_number for c in cameras] == [0, 1]
 
-    def test_duplicate_names_with_alternative_keep_unique_platform_ids(self) -> None:
-        """When hardware paths exist, no device number is needed."""
-        output = """
-[in#0 @ 0000023be5915d00] "Twin Camera" (video)
-[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#one"
-[in#0 @ 0000023be5915d00] "Twin Camera" (video)
-[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#two"
-"""
-        with (
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
-            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
-            mock.patch(
-                "micecam.camera_manager._run_ffmpeg",
-                return_value=output,
-            ),
-            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=True),
+    def test_reorder_by_com_stable_order_sorts_duplicates(self) -> None:
+        """COM-stable ordering ensures device_number is deterministic."""
+        # Two ffmpeg-discovered cameras in arbitrary order:
+        cameras = [
+            CameraInfo(0, "USB Camera", "video=USB Camera"),
+            CameraInfo(1, "USB Camera", "video=USB Camera"),
+            CameraInfo(2, "Unique Cam", "video=Unique Cam"),
+        ]
+        # COM reports them in a specific stable order
+        com_records = [
+            ("USB Camera", r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00#7&bbb&0&0000#{...}\global"),
+            ("USB Camera", r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00#7&aaa&0&0000#{...}\global"),
+        ]
+        with mock.patch(
+            "micecam.camera_manager._enumerate_dshow_video_monikers_com",
+            return_value=com_records,
         ):
-            cameras = _list_devices_windows()
+            _reorder_by_com_stable_order(cameras)
 
-        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
-        assert [c.platform_id for c in cameras] == [
-            "video=@device_pnp_\\\\?\\usb#one",
-            "video=@device_pnp_\\\\?\\usb#two",
+        # After reorder: "USB Camera" group sorted by COM instance key
+        # aaa < bbb, so camera with aaa comes first
+        assert cameras[0].name == "USB Camera"
+        assert cameras[1].name == "USB Camera"
+        assert cameras[2].name == "Unique Cam"
+        # device_number assignment after this will be stable
+        _suffix_duplicate_camera_names(cameras)
+        assert [c.name for c in cameras] == [
+            "USB Camera #1", "USB Camera #2", "Unique Cam"
         ]
-        assert [c.device_number for c in cameras] == [None, None]
+        assert [c.device_number for c in cameras] == [0, 1, None]
 
-    def test_unusable_alternative_names_fall_back_to_ordinals(self) -> None:
-        output = """
-[in#0 @ 0000023be5915d00] "Twin Camera" (video)
-[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#bad-one"
-[in#0 @ 0000023be5915d00] "Twin Camera" (video)
-[in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#bad-two"
-"""
-        with (
-            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
-            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=False),
-        ):
-            cameras = _list_devices_windows()
-
-        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
-        assert [c.platform_id for c in cameras] == [
-            "video=Twin Camera",
-            "video=Twin Camera",
+    def test_reorder_by_com_stable_order_no_duplicates(self) -> None:
+        """When all cameras have unique names, reorder is a no-op."""
+        cameras = [
+            CameraInfo(0, "Camera A", "video=Camera A"),
+            CameraInfo(1, "Camera B", "video=Camera B"),
         ]
-        assert [c.device_number for c in cameras] == [0, 1]
-
-    def test_duplicate_names_use_com_stable_ids_when_available(self) -> None:
-        """Duplicate friendly names should prefer exact COM monikers over ordinals."""
-        output = """
-[dshow @ 0000021b8a9e2c00] DirectShow video devices
-[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
-[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
-[dshow @ 0000021b8a9e2c00] DirectShow audio devices
-"""
-        pnp = [
-            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#one"),
-            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#two"),
-        ]
-        with (
-            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=pnp),
-            mock.patch("micecam.camera_manager._list_devices_windows_pnp") as pnp_mock,
-            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=True),
-        ):
-            cameras = _list_devices_windows()
-
-        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
-        assert [c.platform_id for c in cameras] == [
-            "video=@device_pnp_\\\\?\\usb#one",
-            "video=@device_pnp_\\\\?\\usb#two",
-        ]
-        assert [c.device_number for c in cameras] == [None, None]
-        pnp_mock.assert_not_called()
+        original = list(cameras)
+        _reorder_by_com_stable_order(cameras)
+        assert cameras == original
 
     def test_duplicate_names_keep_ordinals_when_com_unavailable(self) -> None:
-        """Do not replace ffmpeg devices with PnP-derived dshow IDs."""
+        """When COM enumeration fails, keep original ffmpeg order."""
         output = """
 [dshow @ 0000021b8a9e2c00] DirectShow video devices
 [dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
@@ -316,36 +278,8 @@ class TestWindowsDeviceListing:
 """
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
-            mock.patch("micecam.camera_manager._list_devices_windows_pnp") as pnp_mock,
-        ):
-            cameras = _list_devices_windows()
-
-        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
-        assert [c.platform_id for c in cameras] == [
-            "video=Twin Camera",
-            "video=Twin Camera",
-        ]
-        assert [c.device_number for c in cameras] == [0, 1]
-        pnp_mock.assert_not_called()
-
-    def test_duplicate_names_keep_ordinals_when_pnp_ids_are_unusable(self) -> None:
-        """Constructed PnP IDs must not replace working ordinal fallbacks blindly."""
-        output = """
-[dshow @ 0000021b8a9e2c00] DirectShow video devices
-[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
-[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
-[dshow @ 0000021b8a9e2c00] DirectShow audio devices
-"""
-        pnp = [
-            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-one"),
-            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-two"),
-        ]
-        with (
-            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
-            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
-            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=False),
+            mock.patch("micecam.camera_manager._enumerate_dshow_video_monikers_com", return_value=[]),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
 
@@ -371,38 +305,31 @@ class TestWindowsDeviceListing:
         ):
             cameras = _list_devices_windows()
 
-        assert cameras == pnp
+        assert len(cameras) == 1
+        assert cameras[0].name == "HD USB Camera"
+        assert cameras[0].platform_id == "video=HD USB Camera"
 
-    def test_pnp_only_unusable_ids_fall_back_to_friendly_ordinals(self) -> None:
+    def test_pnp_fallback_always_uses_friendly_names(self) -> None:
+        """PnP fallback uses friendly-name dshow IDs (not @device_pnp_...)."""
         pnp = [
-            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-one"),
-            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-two"),
+            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#path-a"),
+            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#path-b"),
         ]
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=""),
             mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
-            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=False),
         ):
             cameras = _list_devices_windows()
 
+        # PnP fallback runs _force_friendly_dshow_ids → all platform_ids
+        # become friendly-name based, regardless of what PnP provided.
         assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
         assert [c.platform_id for c in cameras] == [
             "video=Twin Camera",
             "video=Twin Camera",
         ]
         assert [c.device_number for c in cameras] == [0, 1]
-
-    def test_construct_dshow_alt_from_registry_child(self) -> None:
-        alt = _dshow_alt_from_registry_child(
-            r"##?#USB#VID_05A3&PID_9230&MI_00#6&1a643e73&0&0000"
-            r"#{65e8773d-8f56-11d0-a3b9-00a0c9223196}"
-        )
-
-        assert alt == (
-            r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
-            r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
-        )
 
     def test_pnp_enumerator_does_not_synthesize_dshow_monikers(self) -> None:
         records = [
@@ -415,10 +342,7 @@ class TestWindowsDeviceListing:
                 "InstanceId": r"USB\VID_05A3&PID_9230&MI_00\7&1B87793B&0&0000",
             },
         ]
-        with (
-            mock.patch("micecam.camera_manager._query_pnp_camera_records", return_value=records),
-            mock.patch("micecam.camera_manager._read_dshow_capture_links_from_registry", return_value=[]),
-        ):
+        with mock.patch("micecam.camera_manager._query_pnp_camera_records", return_value=records):
             cameras = _list_devices_windows_pnp()
 
         assert [c.platform_id for c in cameras] == [
@@ -426,33 +350,37 @@ class TestWindowsDeviceListing:
             "video=Twin Camera",
         ]
 
-    def test_pnp_enumerator_ignores_registry_capture_links(self) -> None:
-        records = [
-            {
-                "FriendlyName": "Twin Camera",
-                "InstanceId": r"USB\VID_05A3&PID_9230&MI_00\6&1A643E73&0&0000",
-            },
-        ]
-        links = [
-            (
-                r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
-                r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
-            )
-        ]
-        with (
-            mock.patch("micecam.camera_manager._query_pnp_camera_records", return_value=records),
-            mock.patch("micecam.camera_manager._read_dshow_capture_links_from_registry", return_value=links),
-        ):
-            cameras = _list_devices_windows_pnp()
-
-        assert cameras[0].platform_id == "video=Twin Camera"
-
-    def test_dshow_unique_name_matches_ffmpeg_colon_replacement(self) -> None:
-        assert _dshow_unique_name_from_display_name(
+    def test_extract_com_instance_sort_key(self) -> None:
+        """Extract stable instance path from COM moniker display name."""
+        display = (
             r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00"
-        ) == r"@device_pnp_\\?\usb#vid_05a3&pid_9260&mi_00"
+            r"#7&32bf2af4&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+        )
+        key = _extract_com_instance_sort_key(display)
+        assert key == r"usb#vid_05a3&pid_9260&mi_00#7&32bf2af4&0&0000"
 
-    def test_com_enumerator_maps_moniker_display_names(self) -> None:
+    def test_extract_com_instance_sort_key_different_cameras(self) -> None:
+        """Two cameras differ only by instance ID → different sort keys."""
+        display_a = (
+            r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00"
+            r"#7&32bf2af4&0&0000#{...}\global"
+        )
+        display_b = (
+            r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00"
+            r"#7&15a3bcd&0&0000#{...}\global"
+        )
+        key_a = _extract_com_instance_sort_key(display_a)
+        key_b = _extract_com_instance_sort_key(display_b)
+        assert key_a != key_b
+        assert key_a < key_b or key_b < key_a  # deterministic ordering
+
+    def test_extract_com_instance_sort_key_fallback(self) -> None:
+        """When the name doesn't match the expected pattern, fall back gracefully."""
+        key = _extract_com_instance_sort_key(r"some:random:path\\?\device")
+        assert "device" in key
+
+    def test_com_enumerator_uses_friendly_names(self) -> None:
+        """COM enumeration now returns friendly-name platform_ids."""
         records = [
             ("Twin Camera", r"@device:pnp:\\?\usb#one"),
             ("Twin Camera", r"@device:pnp:\\?\usb#two"),
@@ -464,15 +392,30 @@ class TestWindowsDeviceListing:
             cameras = _list_devices_windows_com()
 
         assert [c.name for c in cameras] == ["Twin Camera", "Twin Camera"]
+        # Both use friendly names (not @device_pnp_...)
         assert [c.platform_id for c in cameras] == [
-            r"video=@device_pnp_\\?\usb#one",
-            r"video=@device_pnp_\\?\usb#two",
+            "video=Twin Camera",
+            "video=Twin Camera",
         ]
 
+    def test_com_enumerator_dedup_by_instance_key(self) -> None:
+        """Same-name cameras get different instance keys → both returned."""
+        records = [
+            ("USB Camera", r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00#unique-a#{...}\global"),
+            ("USB Camera", r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00#unique-b#{...}\global"),
+        ]
+        with mock.patch(
+            "micecam.camera_manager._enumerate_dshow_video_monikers_com",
+            return_value=records,
+        ):
+            cameras = _list_devices_windows_com()
+
+        assert len(cameras) == 2  # both returned, not deduped away
+
     def test_falls_back_to_com_when_ffmpeg_outputs_only_errors(self) -> None:
-        """COM exact monikers are preferred before PnP fallback."""
+        """COM fallback uses friendly-name platform_ids."""
         com = [
-            CameraInfo(0, "HD USB Camera", "video=@device_pnp_\\\\?\\usb#stable")
+            CameraInfo(0, "HD USB Camera", "video=HD USB Camera")
         ]
         with (
             mock.patch(
@@ -484,7 +427,9 @@ class TestWindowsDeviceListing:
         ):
             cameras = _list_devices_windows()
 
-        assert cameras == com
+        assert len(cameras) == 1
+        assert cameras[0].name == "HD USB Camera"
+        assert cameras[0].platform_id == "video=HD USB Camera"
         pnp_mock.assert_not_called()
 
 

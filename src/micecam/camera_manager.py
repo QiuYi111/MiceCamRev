@@ -157,13 +157,12 @@ def _list_devices_windows() -> list[CameraInfo]:
     1. ffmpeg 7+  treats ``-list_devices`` as a *generic* option (before ``-f``)
     2. ffmpeg <7 requires the *format-specific* position (after ``-f dshow``)
 
-    **Duplicate-camera disambiguation:** When two cameras share the same
-    friendly name (e.g. two identical USB cameras), prefer a stable
-    ``@device_pnp_...`` DirectShow moniker over the fragile friendly-name
-    ordinal, but only when that moniker comes from ffmpeg's own
-    "Alternative name" output or from DirectShow COM enumeration. PnP records
-    are used only as a friendly-name fallback; they are not trusted as dshow
-    input IDs.
+    Uses friendly-name dshow identifiers everywhere — not ``@device_pnp_…``
+    moniker paths.  The moniker-based paths (from ffmpeg "Alternative name"
+    or COM enumeration) can pass ``-list_options`` validation yet fail during
+    actual streaming capture.  Friendly-name resolution in DirectShow is more
+    permissive and works reliably with ``-video_device_number`` for
+    disambiguating duplicate names.
     """
     cameras: list[CameraInfo] = []
     for args in (
@@ -179,7 +178,6 @@ def _list_devices_windows() -> list[CameraInfo]:
     if not cameras:
         com_cameras = _list_devices_windows_com()
         if com_cameras:
-            _validate_or_fallback_stable_ids(com_cameras, "COM")
             _suffix_duplicate_camera_names(com_cameras)
             logger.info("Found %d dshow camera(s) via COM", len(com_cameras))
             for c in com_cameras:
@@ -197,13 +195,15 @@ def _list_devices_windows() -> list[CameraInfo]:
         logger.warning("No Windows camera devices found")
         return []
 
-    _validate_or_fallback_stable_ids(cameras, "ffmpeg Alternative name")
+    # When duplicate friendly names exist, reorder cameras to match COM's
+    # stable enumeration order before assigning device_number ordinals.
+    # Both ffmpeg and COM use the same ICreateDevEnum DirectShow API, so
+    # their enumeration order is consistent — sorting by COM instance ID
+    # makes device_number deterministic across separate ffmpeg processes.
+    _reorder_by_com_stable_order(cameras)
 
-    if _needs_pnp_stable_ids(cameras):
-        stable_cameras = _list_devices_windows_com()
-        cameras = _apply_stable_dshow_ids(cameras, stable_cameras)
-
-    # Keep UI/output labels unique without changing the DirectShow ID.
+    # Keep UI/output labels unique and set device_number ordinals for
+    # same-name cameras so they can be disambiguated at ffmpeg invocation.
     _suffix_duplicate_camera_names(cameras)
 
     logger.info("Found %d dshow camera(s)", len(cameras))
@@ -213,11 +213,19 @@ def _list_devices_windows() -> list[CameraInfo]:
 
 
 def _parse_dshow_device_list(output: str) -> list[CameraInfo]:
-    """Parse ffmpeg dshow -list_devices output without side effects."""
+    """Parse ffmpeg dshow -list_devices output without side effects.
+
+    Uses the camera's friendly name as the dshow identifier.  While ffmpeg
+    also emits an "Alternative name" (``@device_pnp_…`` moniker path), that
+    identifier can pass ``-list_options`` (a lightweight DirectShow query)
+    yet fail during actual streaming capture.  Friendly-name resolution is
+    more permissive and works reliably with ``-video_device_number`` for
+    disambiguating duplicate names.
+    """
     cameras: list[CameraInfo] = []
     has_section_headers = "DirectShow video devices" in output
     in_video_section = not has_section_headers
-    pending_camera: CameraInfo | None = None
+    seen_alt_names: set[str] = set()
 
     for line in output.splitlines():
         line = line.strip()
@@ -238,23 +246,123 @@ def _parse_dshow_device_list(output: str) -> list[CameraInfo]:
             if dev_kind == "video":
                 idx = len(cameras)
                 escaped = dev_name.replace("\\", "\\\\").replace(":", "\\:")
-                pending_camera = CameraInfo(
+                cameras.append(CameraInfo(
                     index=idx,
                     name=dev_name,
                     platform_id=f"video={escaped}",
-                )
-                cameras.append(pending_camera)
-            else:
-                pending_camera = None
+                ))
             continue
 
-        if "Alternative name" in line and pending_camera is not None:
+        # Record Alternative names for logging / diagnostics, but do NOT
+        # use them as the dshow device id — they fail for actual capture
+        # on some cameras even though -list_options succeeds.
+        if "Alternative name" in line:
             alt_match = re.search(r'"(@[^"]+)"', line)
             if alt_match:
-                pending_camera.platform_id = f"video={alt_match.group(1)}"
+                seen_alt_names.add(alt_match.group(1))
             continue
 
+    if seen_alt_names:
+        logger.debug("ffmpeg reported %d alternative name(s): %s",
+                     len(seen_alt_names), sorted(seen_alt_names))
     return cameras
+
+
+def _extract_com_instance_sort_key(display_name: str) -> str:
+    """Extract a stable, sortable instance identifier from a COM moniker
+    display name.
+
+    A DirectShow moniker looks like::
+
+        @device:pnp:\\\\?\\usb#vid_05a3&pid_9260&mi_00#7&32bf2af4&0&0000#{...}\\global
+
+    The portion after ``\\\\?\\`` and before the ``#``-prefixed GUID is
+    the canonical device-instance path — unique per physical device and
+    stable across reboots.
+    """
+    # Strip the @device:pnp:\\?\ prefix and \global\{GUID} suffix
+    match = re.search(
+        r'^@device:pnp:\\\\\?\\'
+        r'(.+?)'           # the instance path (captured)
+        r'#\{[0-9a-fA-F-]+\}'  # category GUID
+        r'(?:\\(?:global|.{8}-.{4}-.{4}-.{4}-.{12}))?$',  # optional \global or \GUID
+        display_name,
+    )
+    if match:
+        return match.group(1).lower()
+    # Fallback: use everything after \\?\
+    idx = display_name.find("\\\\?\\")
+    if idx != -1:
+        return display_name[idx + 4:].lower()
+    return display_name.lower()
+
+
+def _reorder_by_com_stable_order(cameras: list[CameraInfo]) -> None:
+    """Reorder *cameras* so same-name devices follow COM's stable enumeration.
+
+    Both ffmpeg and COM use ``ICreateDevEnum::CreateClassEnumerator`` to
+    enumerate DirectShow video devices, so their listing order is the same.
+    COM's order is deterministic (based on the device-instance tree), which
+    makes ``-video_device_number`` reliably map to the same physical camera
+    across separate ffmpeg process invocations.
+
+    Only cameras whose friendly name appears more than once are reordered;
+    uniquely-named cameras stay in their original position.
+    """
+    name_counts: dict[str, int] = {}
+    for cam in cameras:
+        name_counts[cam.name] = name_counts.get(cam.name, 0) + 1
+    dup_names = {n for n, c in name_counts.items() if c > 1}
+    if not dup_names:
+        return
+
+    # Enumerate via COM to get the canonical device order
+    com_records = _enumerate_dshow_video_monikers_com()
+    if not com_records:
+        logger.debug("Cannot reorder: COM enumeration returned nothing")
+        return
+
+    # Build COM-stable ordering per friendly name.
+    # COM enumerates devices in deterministic order; we record that order
+    # per name so we can sort ffmpeg-discovered cameras to match.
+    com_order: dict[str, list[str]] = {}  # name → [instance_key_0, ...]
+    for friendly_name, display_name in com_records:
+        if friendly_name not in dup_names:
+            continue
+        key = _extract_com_instance_sort_key(display_name)
+        com_order.setdefault(friendly_name, []).append(key)
+
+    logger.debug("COM stable order for duplicate cameras: %s",
+                 {n: v for n, v in com_order.items()})
+
+    # For each duplicate name, pair ffmpeg cameras with COM instance keys
+    # by position, then sort the pairs by COM key.  This forces the camera
+    # list order to match COM's deterministic enumeration.
+    for dup_name in dup_names:
+        group = [c for c in cameras if c.name == dup_name]
+        keys = com_order.get(dup_name, [])
+        if len(group) != len(keys):
+            logger.debug(
+                "Cannot reorder '%s': ffmpeg has %d, COM has %d",
+                dup_name, len(group), len(keys),
+            )
+            continue
+        # Pair by position (both APIs enumerate in the same order) and sort
+        paired = sorted(zip(group, keys), key=lambda x: x[1])
+        sorted_group = [cam for cam, _key in paired]
+        # Write back in-place, preserving the index range of the group
+        group_indices = [i for i, c in enumerate(cameras) if c.name == dup_name]
+        for dst_idx, cam in zip(group_indices, sorted_group):
+            cameras[dst_idx] = cam
+        logger.info(
+            "Reordered '%s' cameras by COM instance order: %s",
+            dup_name,
+            [(c.platform_id, k) for c, k in paired],
+        )
+
+    # Re-assign sequential indices
+    for i, cam in enumerate(cameras):
+        cam.index = i
 
 
 def _suffix_duplicate_camera_names(cameras: list[CameraInfo]) -> None:
@@ -285,63 +393,6 @@ def _suffix_duplicate_camera_names(cameras: list[CameraInfo]) -> None:
         cam.name += suffix
 
 
-def _apply_stable_dshow_ids(
-    cameras: list[CameraInfo],
-    stable_cameras: list[CameraInfo],
-) -> list[CameraInfo]:
-    """Replace friendly-name duplicate IDs with stable DirectShow monikers."""
-    if not cameras or not stable_cameras:
-        return cameras
-
-    stable_by_name: dict[str, list[CameraInfo]] = {}
-    for cam in stable_cameras:
-        stable_by_name.setdefault(cam.name, []).append(cam)
-
-    occurrence: dict[str, int] = {}
-    for cam in cameras:
-        if _is_dshow_alternative_id(cam.platform_id):
-            continue
-        occurrence[cam.name] = occurrence.get(cam.name, 0) + 1
-        candidates = stable_by_name.get(cam.name, [])
-        candidate_index = occurrence[cam.name] - 1
-        if candidate_index >= len(candidates):
-            continue
-        stable = candidates[candidate_index]
-        if not _is_dshow_alternative_id(stable.platform_id):
-            continue
-        if not _dshow_device_id_usable(stable.platform_id):
-            logger.warning(
-                "Stable DirectShow ID for camera '%s' is not usable; keeping "
-                "friendly-name ordinal fallback: %s",
-                cam.name,
-                stable.platform_id,
-            )
-            continue
-        logger.info("Using stable DirectShow ID for camera '%s': %s", cam.name, stable.platform_id)
-        cam.platform_id = stable.platform_id
-        cam.device_number = None
-    return cameras
-
-
-def _validate_or_fallback_stable_ids(cameras: list[CameraInfo], source: str) -> None:
-    """Keep stable monikers only when dshow can query options for them."""
-    for cam in cameras:
-        if not _is_dshow_alternative_id(cam.platform_id):
-            continue
-        if _dshow_device_id_usable(cam.platform_id):
-            continue
-        logger.warning(
-            "%s ID for camera '%s' is not usable by dshow; falling back "
-            "to friendly-name opening: %s",
-            source,
-            cam.name,
-            cam.platform_id,
-        )
-        escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
-        cam.platform_id = f"video={escaped}"
-        cam.device_number = None
-
-
 def _force_friendly_dshow_ids(cameras: list[CameraInfo]) -> None:
     """Use only friendly-name dshow IDs for non-DirectShow enumeration fallbacks."""
     for cam in cameras:
@@ -350,99 +401,43 @@ def _force_friendly_dshow_ids(cameras: list[CameraInfo]) -> None:
         cam.device_number = None
 
 
-def _dshow_device_id_usable(
-    platform_id: str,
-    device_number: int | None = None,
-) -> bool:
-    """Return True when DirectShow can enumerate options for a device id."""
-    output = _run_ffmpeg(
-        [
-            "-f", "dshow",
-            "-list_options", "true",
-            *(
-                ["-video_device_number", str(device_number)]
-                if device_number is not None else []
-            ),
-            "-i", platform_id,
-        ],
-        timeout=8,
-    )
-    lower = output.lower()
-    has_options = (
-        "directshow video device options" in lower
-        or "vcodec=" in lower
-        or "pixel_format=" in lower
-        or re.search(r"\bs=\d+x\d+\s+fps=", lower) is not None
-    )
-    if has_options:
-        return True
-    if output.strip():
-        logger.debug("dshow device id unusable for %s:\n%s", platform_id, output)
-    return False
-
-
-def _is_dshow_alternative_id(platform_id: str) -> bool:
-    """Return True for ffmpeg dshow alternative-name monikers."""
-    return platform_id.lower().startswith("video=@")
-
-
-def _needs_pnp_stable_ids(cameras: list[CameraInfo]) -> bool:
-    """Return True when parsed dshow devices still depend on friendly-name ordinals."""
-    if not cameras:
-        return True
-    name_counts: dict[str, int] = {}
-    for cam in cameras:
-        name_counts[cam.name] = name_counts.get(cam.name, 0) + 1
-    for cam in cameras:
-        if name_counts[cam.name] <= 1:
-            continue
-        if not _is_dshow_alternative_id(cam.platform_id):
-            return True
-    return False
-
-
 def _list_devices_windows_com() -> list[CameraInfo]:
     """Enumerate DirectShow video devices through COM monikers.
 
-    FFmpeg's dshow "Alternative name" is derived from the same moniker
-    display name, with ':' replaced by '_'.  Querying COM directly gives us
-    the exact per-device identifier even when ffmpeg's device-list output is
-    unavailable or only contains duplicate friendly names.
+    Returns cameras identified by **friendly name** (not the ``@device_pnp_…``
+    moniker path), because the moniker-based alternative name passes
+    ``-list_options`` but often fails during actual streaming capture.
+    Friendly-name resolution in DirectShow is more permissive and works
+    reliably with ``-video_device_number`` for disambiguation.
+
+    Same-name cameras are distinguished by their COM instance key so that
+    *both* are returned even though they share the same friendly-name
+    ``platform_id``.
     """
     records = _enumerate_dshow_video_monikers_com()
     cameras: list[CameraInfo] = []
     seen: set[str] = set()
     for friendly_name, display_name in records:
-        if not display_name:
+        if not friendly_name or not display_name:
             continue
-        alt_name = _dshow_unique_name_from_display_name(display_name)
-        platform_id = f"video={alt_name}"
-        seen_key = platform_id.lower()
-        if seen_key in seen:
+        # Dedup by instance key (unique per physical device), not by
+        # platform_id (which is the same for same-name cameras).
+        instance_key = _extract_com_instance_sort_key(display_name)
+        if instance_key in seen:
             continue
-        seen.add(seen_key)
+        seen.add(instance_key)
+        escaped = friendly_name.replace("\\", "\\\\").replace(":", "\\:")
+        platform_id = f"video={escaped}"
+        logger.debug(
+            "COM camera: friendly=%r instance=%r → platform_id=%r",
+            friendly_name, instance_key, platform_id,
+        )
         cameras.append(CameraInfo(
             index=len(cameras),
-            name=friendly_name or display_name,
+            name=friendly_name,
             platform_id=platform_id,
         ))
     return cameras
-
-
-def _dshow_unique_name_from_display_name(display_name: str) -> str:
-    """Convert an IMoniker display name to ffmpeg's dshow alternative name.
-
-    ffmpeg's ``libavdevice/dshow.c`` replaces every ``:`` in the device
-    display name with ``_`` to produce its "Alternative name".  We do the
-    same here so the resulting ``@device_pnp_…`` ID matches exactly what
-    ffmpeg would generate internally.
-    """
-    alt_name = display_name.replace(":", "_")
-    logger.debug(
-        "dshow display_name → alternative name:\n  raw  = %s\n  alt  = %s",
-        display_name, alt_name,
-    )
-    return alt_name
 
 
 def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:

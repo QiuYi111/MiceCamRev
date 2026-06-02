@@ -86,6 +86,13 @@ class PreviewThread(QtCore.QThread):
                     ["-video_device_number", str(self.device_number)]
                     if self.device_number is not None else []
                 ),
+                # Large real-time buffer prevents I/O errors when a camera
+                # produces large keyframes (common with MJPEG).  The default
+                # is ~30 MB; matching the recorder's 2000 MB is safe.
+                "-rtbufsize", "2000M",
+                # Thread queue size for the input demuxer — larger values
+                # smooth out jitter at high framerates.
+                "-thread_queue_size", "1024",
                 *(
                     ["-vcodec", self.native_codec]
                     if self.native_codec in {"mjpeg", "h264", "hevc"} else []
