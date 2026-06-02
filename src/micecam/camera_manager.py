@@ -161,10 +161,10 @@ def _list_devices_windows() -> list[CameraInfo]:
     **Duplicate-camera disambiguation:** When two cameras share the same
     friendly name (e.g. two identical USB cameras), prefer a stable
     ``@device_pnp_...`` DirectShow moniker over the fragile friendly-name
-    ordinal.  The moniker can come from ffmpeg's "Alternative name" output
-    or from DirectShow COM enumeration.  PnP/DeviceClasses and
-    ``-video_device_number`` are kept only as fallbacks for old/incomplete
-    systems.
+    ordinal, but only when that moniker comes from ffmpeg's own
+    "Alternative name" output or from DirectShow COM enumeration. PnP records
+    are used only as a friendly-name fallback; they are not trusted as dshow
+    input IDs.
     """
     cameras: list[CameraInfo] = []
     for args in (
@@ -180,35 +180,36 @@ def _list_devices_windows() -> list[CameraInfo]:
     if not cameras:
         com_cameras = _list_devices_windows_com()
         if com_cameras:
+            _validate_or_fallback_stable_ids(com_cameras, "COM")
             _suffix_duplicate_camera_names(com_cameras)
             logger.info("Found %d dshow camera(s) via COM", len(com_cameras))
             for c in com_cameras:
-                logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+                logger.info("  [%d] %s -> %s", c.index, c.name, c.platform_id)
             return com_cameras
 
         pnp_cameras = _list_devices_windows_pnp()
         if pnp_cameras:
-            _validate_or_fallback_pnp_ids(pnp_cameras)
+            _force_friendly_dshow_ids(pnp_cameras)
             _suffix_duplicate_camera_names(pnp_cameras)
-            logger.info("Found %d dshow camera(s) via PnP", len(pnp_cameras))
+            logger.info("Found %d dshow camera(s) via PnP friendly-name fallback", len(pnp_cameras))
             for c in pnp_cameras:
-                logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+                logger.info("  [%d] %s -> %s", c.index, c.name, c.platform_id)
             return pnp_cameras
         logger.warning("No Windows camera devices found")
         return []
 
+    _validate_or_fallback_stable_ids(cameras, "ffmpeg Alternative name")
+
     if _needs_pnp_stable_ids(cameras):
         stable_cameras = _list_devices_windows_com()
-        if not stable_cameras:
-            stable_cameras = _list_devices_windows_pnp()
-        cameras = _apply_pnp_stable_ids(cameras, stable_cameras)
+        cameras = _apply_stable_dshow_ids(cameras, stable_cameras)
 
     # Keep UI/output labels unique without changing the DirectShow ID.
     _suffix_duplicate_camera_names(cameras)
 
     logger.info("Found %d dshow camera(s)", len(cameras))
     for c in cameras:
-        logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+        logger.info("  [%d] %s -> %s", c.index, c.name, c.platform_id)
     return cameras
 
 
@@ -285,24 +286,24 @@ def _suffix_duplicate_camera_names(cameras: list[CameraInfo]) -> None:
         cam.name += suffix
 
 
-def _apply_pnp_stable_ids(
+def _apply_stable_dshow_ids(
     cameras: list[CameraInfo],
-    pnp_cameras: list[CameraInfo],
+    stable_cameras: list[CameraInfo],
 ) -> list[CameraInfo]:
     """Replace friendly-name duplicate IDs with stable DirectShow monikers."""
-    if not cameras or not pnp_cameras:
+    if not cameras or not stable_cameras:
         return cameras
 
-    pnp_by_name: dict[str, list[CameraInfo]] = {}
-    for cam in pnp_cameras:
-        pnp_by_name.setdefault(cam.name, []).append(cam)
+    stable_by_name: dict[str, list[CameraInfo]] = {}
+    for cam in stable_cameras:
+        stable_by_name.setdefault(cam.name, []).append(cam)
 
     occurrence: dict[str, int] = {}
     for cam in cameras:
         if _is_dshow_alternative_id(cam.platform_id):
             continue
         occurrence[cam.name] = occurrence.get(cam.name, 0) + 1
-        candidates = pnp_by_name.get(cam.name, [])
+        candidates = stable_by_name.get(cam.name, [])
         candidate_index = occurrence[cam.name] - 1
         if candidate_index >= len(candidates):
             continue
@@ -323,19 +324,28 @@ def _apply_pnp_stable_ids(
     return cameras
 
 
-def _validate_or_fallback_pnp_ids(cameras: list[CameraInfo]) -> None:
-    """Keep PnP monikers only when dshow can query options for them."""
+def _validate_or_fallback_stable_ids(cameras: list[CameraInfo], source: str) -> None:
+    """Keep stable monikers only when dshow can query options for them."""
     for cam in cameras:
         if not _is_dshow_alternative_id(cam.platform_id):
             continue
         if _dshow_device_id_usable(cam.platform_id):
             continue
         logger.warning(
-            "PnP ID for camera '%s' is not usable by dshow; falling back to "
-            "friendly-name opening: %s",
+            "%s ID for camera '%s' is not usable by dshow; falling back "
+            "to friendly-name opening: %s",
+            source,
             cam.name,
             cam.platform_id,
         )
+        escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
+        cam.platform_id = f"video={escaped}"
+        cam.device_number = None
+
+
+def _force_friendly_dshow_ids(cameras: list[CameraInfo]) -> None:
+    """Use only friendly-name dshow IDs for non-DirectShow enumeration fallbacks."""
+    for cam in cameras:
         escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
         cam.platform_id = f"video={escaped}"
         cam.device_number = None
@@ -714,14 +724,12 @@ def _read_dshow_moniker_property(
 
 
 def _list_devices_windows_pnp() -> list[CameraInfo]:
-    """Enumerate Windows cameras from PnP records and DirectShow registry links."""
+    """Enumerate Windows cameras from PnP records as friendly-name fallbacks."""
     records = _query_pnp_camera_records()
     if not records:
         return []
 
-    capture_links = _read_dshow_capture_links_from_registry()
     cameras: list[CameraInfo] = []
-    seen: set[str] = set()
     seen_instances: set[str] = set()
     for rec in records:
         name = rec.get("FriendlyName") or rec.get("Name") or ""
@@ -733,21 +741,8 @@ def _list_devices_windows_pnp() -> list[CameraInfo]:
             continue
         seen_instances.add(instance_key)
 
-        alt = _find_capture_link_for_instance(instance_id, capture_links)
-        if alt is not None:
-            platform_id = f"video={alt}"
-            if platform_id in seen:
-                continue
-            seen.add(platform_id)
-        else:
-            logger.warning(
-                "No DirectShow capture link found for PnP camera '%s' (%s); "
-                "using friendly-name ordinal fallback.",
-                name,
-                instance_id,
-            )
-            escaped = name.replace("\\", "\\\\").replace(":", "\\:")
-            platform_id = f"video={escaped}"
+        escaped = name.replace("\\", "\\\\").replace(":", "\\:")
+        platform_id = f"video={escaped}"
         cameras.append(CameraInfo(
             index=len(cameras),
             name=name,
