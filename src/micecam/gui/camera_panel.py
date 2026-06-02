@@ -31,9 +31,10 @@ from micecam.recorder import Recorder
 
 logger = logging.getLogger(__name__)
 
-# Preview dimensions (kept low to avoid taxing the camera / USB bus)
-PREVIEW_MAX_W = 640
-PREVIEW_MAX_H = 480
+# Preview dimensions — 1080p ceiling so we can find a resolution whose
+# native fps range includes ≤30 (many cameras only offer 120 fps at QVGA/VGA).
+PREVIEW_MAX_W = 1920
+PREVIEW_MAX_H = 1080
 PREVIEW_PREFERRED_FPS = 15
 
 
@@ -242,6 +243,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._cameras = cameras
         self._preview_thread: Optional[PreviewThread] = None
         self._recorder: Optional[Recorder] = None
+        self._defer_preview = False  # set during refresh to suppress signal-fired auto-start
         self._current_camera: Optional[CameraInfo] = None
 
         self.setTitle(f"Camera {panel_id + 1}")
@@ -330,16 +332,16 @@ class CameraPanel(QtWidgets.QGroupBox):
 
     # ── Camera selection ─────────────────────────────────────────────
 
-    def _populate_cameras(self) -> None:
+    def _populate_cameras(self, start_preview: bool = True) -> None:
         self._cam_combo.clear()
         for cam in self._cameras:
             self._cam_combo.addItem(f"[{cam.index}] {cam.name}", cam)
         if self._cameras:
             default_index = min(self.panel_id, len(self._cameras) - 1)
             self._cam_combo.setCurrentIndex(default_index)
-            self._on_camera_changed(default_index)
+            self._on_camera_changed(default_index, start_preview=start_preview)
 
-    def _on_camera_changed(self, index: int) -> None:
+    def _on_camera_changed(self, index: int, start_preview: bool = True) -> None:
         if index < 0 or index >= len(self._cameras):
             return
         cam = self._cameras[index]
@@ -356,8 +358,9 @@ class CameraPanel(QtWidgets.QGroupBox):
         if cam.supported_resolutions:
             self._update_fps_for_resolution(cam.supported_resolutions[0])
 
-        # Start preview for this camera
-        self._start_preview(cam)
+        # Start preview for this camera (suppressed during batch refresh)
+        if start_preview and not self._defer_preview:
+            self._start_preview(cam)
 
     def _on_resolution_changed(self, index: int) -> None:
         """When the user picks a different resolution, update the FPS dropdown
@@ -468,14 +471,19 @@ class CameraPanel(QtWidgets.QGroupBox):
             else:
                 self._fps_combo.setCurrentIndex(0)
 
-    def refresh_cameras(self, cameras: list[CameraInfo]) -> None:
-        """Update the camera list (e.g., after a device change)."""
+    def refresh_cameras(self, cameras: list[CameraInfo], start_preview: bool = True) -> None:
+        """Update the camera list (e.g., after a device change).
+
+        When *start_preview* is False the caller is expected to start the
+        preview later (e.g. for simultaneous dual-camera launch).
+        """
         current = self._cam_combo.currentData()
         current_key = (
             (current.platform_id, current.device_number)
             if current is not None else None
         )
         self._cameras = cameras
+        self._defer_preview = True  # suppress signal-fired auto-start below
         self._cam_combo.blockSignals(True)
         self._cam_combo.clear()
         for cam in cameras:
@@ -494,7 +502,15 @@ class CameraPanel(QtWidgets.QGroupBox):
         if not restored and cameras:
             default_index = min(self.panel_id, len(cameras) - 1)
             self._cam_combo.setCurrentIndex(default_index)
-            self._on_camera_changed(default_index)
+            self._on_camera_changed(default_index, start_preview=False)
+        elif restored and start_preview:
+            self._start_preview(self._current_camera)
+        self._defer_preview = False
+
+    def start_preview(self) -> None:
+        """Start the preview for the currently selected camera."""
+        if self._current_camera:
+            self._start_preview(self._current_camera)
 
     # ── Preview ──────────────────────────────────────────────────────
 
@@ -528,26 +544,43 @@ class CameraPanel(QtWidgets.QGroupBox):
         """
         Pick a low-bandwidth preview mode from the camera capabilities.
 
-        Prefer a small resolution and <=15 fps so the preview does not consume
-        the same scarce DirectShow/USB resources as the recording stream.
-        """
-        resolutions = cam.supported_resolutions or [(PREVIEW_MAX_W, PREVIEW_MAX_H)]
-        candidates = [
-            res for res in resolutions
-            if res[0] <= PREVIEW_MAX_W and res[1] <= PREVIEW_MAX_H
-        ] or resolutions
-        preview_res = min(candidates, key=lambda res: (res[0] * res[1], res[0], res[1]))
+        Only considers resolutions that have **per-resolution** fps data in
+        ``resolution_fps``, because the global ``supported_framerates`` list
+        aggregates fps values across ALL resolutions — a value like 13 fps
+        may exist on the list but be invalid for a specific resolution (e.g.
+        800×600 may only support 30 fps).
 
-        fps_values = (
-            cam.resolution_fps.get(preview_res)
-            if cam.resolution_fps and preview_res in cam.resolution_fps
-            else cam.supported_framerates
-        ) or [PREVIEW_PREFERRED_FPS]
-        low_fps = [fps for fps in fps_values if fps <= PREVIEW_PREFERRED_FPS]
-        if low_fps:
-            preview_fps = max(low_fps)
+        Skips resolutions whose only fps options are > 30 (many cameras
+        advertise 120 fps at QVGA/VGA but those modes are unreliable).
+        """
+        # Use per-resolution data when available; fall back to flat lists
+        if cam.resolution_fps:
+            candidates = sorted(
+                [r for r in cam.resolution_fps if r[0] <= PREVIEW_MAX_W and r[1] <= PREVIEW_MAX_H],
+                key=lambda r: (r[0] * r[1], r[0], r[1]),
+            )
         else:
-            preview_fps = min(fps_values)
+            candidates = sorted(
+                cam.supported_resolutions or [(PREVIEW_MAX_W, PREVIEW_MAX_H)],
+                key=lambda r: (r[0] * r[1], r[0], r[1]),
+            )
+
+        # Walk resolutions from smallest to largest; pick the first one
+        # whose lowest available fps is ≤ 30 (reliable capture range).
+        for preview_res in candidates:
+            fps_values = cam.resolution_fps.get(preview_res) if cam.resolution_fps else cam.supported_framerates
+            if not fps_values:
+                continue
+            usable = [f for f in fps_values if f <= 30]
+            if usable:
+                low = [f for f in usable if f <= PREVIEW_PREFERRED_FPS]
+                preview_fps = max(low) if low else min(usable)
+                return preview_res, preview_fps
+
+        # Fallback: smallest resolution, lowest fps available
+        preview_res = candidates[0]
+        fps_values = cam.resolution_fps.get(preview_res) if cam.resolution_fps else cam.supported_framerates
+        preview_fps = min(fps_values) if fps_values else PREVIEW_PREFERRED_FPS
         return preview_res, preview_fps
 
     def _stop_preview(self) -> None:

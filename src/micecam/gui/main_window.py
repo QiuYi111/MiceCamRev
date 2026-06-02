@@ -158,8 +158,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         cam.index, cam.name,
                         cam.supported_resolutions, cam.supported_framerates)
 
-        self._panel1.refresh_cameras(self._cameras)
-        self._panel2.refresh_cameras(self._cameras)
+        # Refresh panels without auto-starting preview, then launch both
+        # preview QThreads back-to-back on the main thread.  The two
+        # subprocess.Popen calls happen in separate OS threads ~1 ms apart
+        # — close enough that DirectShow enumeration sees both cameras
+        # available before either one is opened.
+        self._panel1.refresh_cameras(self._cameras, start_preview=False)
+        self._panel2.refresh_cameras(self._cameras, start_preview=False)
+        self._panel1.start_preview()
+        self._panel2.start_preview()
 
         self._status_bar.showMessage(
             f"Ready — {len(self._cameras)} camera(s) found"

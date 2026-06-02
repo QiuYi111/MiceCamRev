@@ -384,9 +384,8 @@ def _suffix_duplicate_camera_names(cameras: list[CameraInfo]) -> None:
         escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
         if cam.platform_id == f"video={escaped}":
             cam.device_number = name_seen[cam.name] - 1
-            logger.warning(
-                "Duplicate camera '%s' disambiguated with -video_device_number %d. "
-                "This is an ordinal fallback; prefer PnP/Alternative-name IDs.",
+            logger.info(
+                "Duplicate camera '%s' -> device_number=%d (COM-stable order)",
                 cam.name,
                 cam.device_number,
             )
