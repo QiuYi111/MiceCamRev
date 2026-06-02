@@ -38,7 +38,6 @@ ENCODER_PRIORITY: dict[str, list[str]] = {
     "Linux": ["h264_vaapi", "hevc_vaapi"],
 }
 FALLBACK_ENCODERS = ["libx264", "libx265"]
-DSHOW_CAPTURE_GUID = "65e8773d-8f56-11d0-a3b9-00a0c9223196"
 
 
 @dataclass
@@ -431,8 +430,19 @@ def _list_devices_windows_com() -> list[CameraInfo]:
 
 
 def _dshow_unique_name_from_display_name(display_name: str) -> str:
-    """Convert an IMoniker display name to ffmpeg's dshow alternative name."""
-    return display_name.replace(":", "_")
+    """Convert an IMoniker display name to ffmpeg's dshow alternative name.
+
+    ffmpeg's ``libavdevice/dshow.c`` replaces every ``:`` in the device
+    display name with ``_`` to produce its "Alternative name".  We do the
+    same here so the resulting ``@device_pnp_…`` ID matches exactly what
+    ffmpeg would generate internally.
+    """
+    alt_name = display_name.replace(":", "_")
+    logger.debug(
+        "dshow display_name → alternative name:\n  raw  = %s\n  alt  = %s",
+        display_name, alt_name,
+    )
+    return alt_name
 
 
 def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
@@ -529,8 +539,6 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     ole32.CoCreateInstance.restype = HRESULT
-    ole32.CreateBindCtx.argtypes = [DWORD, ctypes.POINTER(ctypes.c_void_p)]
-    ole32.CreateBindCtx.restype = HRESULT
     ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
     ole32.CoTaskMemFree.restype = None
     oleaut32.VariantClear.argtypes = [ctypes.POINTER(VARIANT)]
@@ -544,7 +552,6 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
     com_initialized = False
     dev_enum = ctypes.c_void_p()
     enum_moniker = ctypes.c_void_p()
-    bind_ctx = ctypes.c_void_p()
     records: list[tuple[str, str]] = []
 
     try:
@@ -587,10 +594,8 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
             logger.debug("CreateClassEnumerator(video) failed: 0x%08x", hresult_u32(hr))
             return []
 
-        hr = ole32.CreateBindCtx(0, ctypes.byref(bind_ctx))
-        if not succeeded(hr) or not bind_ctx:
-            logger.debug("CreateBindCtx failed: 0x%08x", hresult_u32(hr))
-            return []
+        # No CreateBindCtx — we pass NULL to IMoniker::GetDisplayName
+        # (matching ffmpeg's own dshow code), so no bind context is needed.
 
         enum_next = com_method(
             enum_moniker,
@@ -609,7 +614,6 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
             try:
                 display_name = _read_dshow_moniker_display_name(
                     moniker,
-                    bind_ctx,
                     com_method,
                     ole32.CoTaskMemFree,
                 )
@@ -624,6 +628,10 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
                     VARIANT,
                 )
                 if display_name:
+                    logger.debug(
+                        "COM moniker display_name=%r friendly_name=%r",
+                        display_name, friendly_name,
+                    )
                     records.append((friendly_name, display_name))
             finally:
                 release(moniker)
@@ -631,7 +639,6 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
         logger.debug("DirectShow COM camera enumeration failed", exc_info=True)
         return []
     finally:
-        release(bind_ctx)
         release(enum_moniker)
         release(dev_enum)
         if com_initialized:
@@ -642,22 +649,29 @@ def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
 
 def _read_dshow_moniker_display_name(
     moniker: object,
-    bind_ctx: object,
     com_method: object,
     co_task_mem_free: object,
 ) -> str:
-    """Read an IMoniker display name and free COM-allocated memory."""
+    """Read an IMoniker display name and free COM-allocated memory.
+
+    Passes NULL for *pbc* (bind context) — matching ffmpeg's own dshow code
+    in ``libavdevice/dshow.c``.  Passing a non-NULL bind context can cause
+    ``IMoniker::GetDisplayName`` to return a different display-name format,
+    which after ``:`` → ``_`` replacement produces a ``@device_pnp_…`` ID
+    that ffmpeg will reject for capture (even though ``-list_options`` may
+    succeed against it).
+    """
     import ctypes
 
     get_display_name = com_method(
         moniker,
-        20,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
+        20,  # IMoniker::GetDisplayName
+        ctypes.c_void_p,  # IBindCtx *pbc — NULL, matching ffmpeg
+        ctypes.c_void_p,  # IMoniker *pmkToLeft — NULL
+        ctypes.POINTER(ctypes.c_void_p),  # LPOLESTR *ppszDisplayName
     )
     name_ptr = ctypes.c_void_p()
-    hr = get_display_name(moniker, bind_ctx, None, ctypes.byref(name_ptr))
+    hr = get_display_name(moniker, None, None, ctypes.byref(name_ptr))
     if ctypes.c_long(hr).value < 0 or not name_ptr:
         return ""
     try:
@@ -792,57 +806,6 @@ def _query_pnp_camera_records() -> list[dict[str, str]]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
-
-
-def _read_dshow_capture_links_from_registry() -> list[str]:
-    """Read stable DirectShow capture symbolic links from DeviceClasses."""
-    try:
-        import winreg
-    except ImportError:
-        return []
-
-    path = (
-        "SYSTEM\\CurrentControlSet\\Control\\DeviceClasses\\"
-        f"{{{DSHOW_CAPTURE_GUID}}}"
-    )
-    links: list[str] = []
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
-            index = 0
-            while True:
-                try:
-                    child = winreg.EnumKey(key, index)
-                except OSError:
-                    break
-                index += 1
-                alt = _dshow_alt_from_registry_child(child)
-                if alt:
-                    links.append(alt)
-    except OSError:
-        logger.debug("Could not read DirectShow DeviceClasses registry", exc_info=True)
-    return links
-
-
-def _dshow_alt_from_registry_child(child: str) -> str | None:
-    """Convert a DeviceClasses child key into an ffmpeg dshow alternative name."""
-    prefix = "##?#"
-    if not child.startswith(prefix):
-        return None
-    body = child[len(prefix):].replace("\\", "#")
-    if f"#{{{DSHOW_CAPTURE_GUID}}}".lower() not in body.lower():
-        return None
-    return f"@device_pnp_\\\\?\\{body.lower()}\\global"
-
-
-def _find_capture_link_for_instance(
-    instance_id: str,
-    capture_links: list[str],
-) -> str | None:
-    needle = instance_id.strip().replace("\\", "#").lower()
-    for link in capture_links:
-        if needle in link.lower():
-            return link
-    return None
 
 
 def _list_devices_linux() -> list[CameraInfo]:
