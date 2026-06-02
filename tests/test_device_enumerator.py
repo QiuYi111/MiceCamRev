@@ -12,10 +12,12 @@ import pytest
 from micecam.camera_manager import (
     CameraInfo,
     EncoderInfo,
-    _dshow_alt_from_instance_id,
     _dshow_alt_from_registry_child,
+    _dshow_unique_name_from_display_name,
     _list_devices_darwin,
     _list_devices_windows,
+    _list_devices_windows_com,
+    _list_devices_windows_pnp,
     _query_caps_windows,
     _run_ffmpeg,
     choose_camera_input_codec,
@@ -150,6 +152,7 @@ class TestWindowsDeviceListing:
     def test_no_cameras(self) -> None:
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=""),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
@@ -210,6 +213,7 @@ class TestWindowsDeviceListing:
 """
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
         ):
             cameras = _list_devices_windows()
@@ -230,6 +234,7 @@ class TestWindowsDeviceListing:
 [in#0 @ 0000023be5915d00]   Alternative name "@device_pnp_\\\\?\\usb#two"
 """
         with (
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[]),
             mock.patch(
                 "micecam.camera_manager._run_ffmpeg",
@@ -245,8 +250,8 @@ class TestWindowsDeviceListing:
         ]
         assert [c.device_number for c in cameras] == [None, None]
 
-    def test_duplicate_names_use_pnp_stable_ids_when_available(self) -> None:
-        """Duplicate friendly names should prefer stable PnP monikers over ordinals."""
+    def test_duplicate_names_use_com_stable_ids_when_available(self) -> None:
+        """Duplicate friendly names should prefer exact COM monikers over ordinals."""
         output = """
 [dshow @ 0000021b8a9e2c00] DirectShow video devices
 [dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
@@ -259,7 +264,9 @@ class TestWindowsDeviceListing:
         ]
         with (
             mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
-            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=pnp),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp") as pnp_mock,
+            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=True),
         ):
             cameras = _list_devices_windows()
 
@@ -269,6 +276,61 @@ class TestWindowsDeviceListing:
             "video=@device_pnp_\\\\?\\usb#two",
         ]
         assert [c.device_number for c in cameras] == [None, None]
+        pnp_mock.assert_not_called()
+
+    def test_duplicate_names_use_pnp_stable_ids_when_com_unavailable(self) -> None:
+        """PnP/DeviceClasses stable links remain a fallback when COM fails."""
+        output = """
+[dshow @ 0000021b8a9e2c00] DirectShow video devices
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00] DirectShow audio devices
+"""
+        pnp = [
+            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#one"),
+            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#two"),
+        ]
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=True),
+        ):
+            cameras = _list_devices_windows()
+
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=@device_pnp_\\\\?\\usb#one",
+            "video=@device_pnp_\\\\?\\usb#two",
+        ]
+        assert [c.device_number for c in cameras] == [None, None]
+
+    def test_duplicate_names_keep_ordinals_when_pnp_ids_are_unusable(self) -> None:
+        """Constructed PnP IDs must not replace working ordinal fallbacks blindly."""
+        output = """
+[dshow @ 0000021b8a9e2c00] DirectShow video devices
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00]  "Twin Camera" (video)
+[dshow @ 0000021b8a9e2c00] DirectShow audio devices
+"""
+        pnp = [
+            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-one"),
+            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-two"),
+        ]
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=output),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=False),
+        ):
+            cameras = _list_devices_windows()
+
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=Twin Camera",
+            "video=Twin Camera",
+        ]
+        assert [c.device_number for c in cameras] == [0, 1]
 
     def test_falls_back_to_pnp_when_ffmpeg_outputs_only_errors(self) -> None:
         """Non-empty ffmpeg error output must not block PnP fallback."""
@@ -280,21 +342,33 @@ class TestWindowsDeviceListing:
                 "micecam.camera_manager._run_ffmpeg",
                 return_value="Could not enumerate video devices\nError opening input file dummy.",
             ),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
             mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=True),
         ):
             cameras = _list_devices_windows()
 
         assert cameras == pnp
 
-    def test_construct_dshow_alt_from_pnp_instance_id(self) -> None:
-        alt = _dshow_alt_from_instance_id(
-            r"USB\VID_05A3&PID_9230&MI_00\6&1A643E73&0&0000"
-        )
+    def test_pnp_only_unusable_ids_fall_back_to_friendly_ordinals(self) -> None:
+        pnp = [
+            CameraInfo(0, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-one"),
+            CameraInfo(1, "Twin Camera", "video=@device_pnp_\\\\?\\usb#bad-two"),
+        ]
+        with (
+            mock.patch("micecam.camera_manager._run_ffmpeg", return_value=""),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[]),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=pnp),
+            mock.patch("micecam.camera_manager._dshow_device_id_usable", return_value=False),
+        ):
+            cameras = _list_devices_windows()
 
-        assert alt == (
-            r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
-            r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
-        )
+        assert [c.name for c in cameras] == ["Twin Camera #1", "Twin Camera #2"]
+        assert [c.platform_id for c in cameras] == [
+            "video=Twin Camera",
+            "video=Twin Camera",
+        ]
+        assert [c.device_number for c in cameras] == [0, 1]
 
     def test_construct_dshow_alt_from_registry_child(self) -> None:
         alt = _dshow_alt_from_registry_child(
@@ -306,6 +380,89 @@ class TestWindowsDeviceListing:
             r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
             r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
         )
+
+    def test_pnp_enumerator_does_not_synthesize_dshow_monikers(self) -> None:
+        records = [
+            {
+                "FriendlyName": "Twin Camera",
+                "InstanceId": r"USB\VID_05A3&PID_9230&MI_00\6&1A643E73&0&0000",
+            },
+            {
+                "FriendlyName": "Twin Camera",
+                "InstanceId": r"USB\VID_05A3&PID_9230&MI_00\7&1B87793B&0&0000",
+            },
+        ]
+        with (
+            mock.patch("micecam.camera_manager._query_pnp_camera_records", return_value=records),
+            mock.patch("micecam.camera_manager._read_dshow_capture_links_from_registry", return_value=[]),
+        ):
+            cameras = _list_devices_windows_pnp()
+
+        assert [c.platform_id for c in cameras] == [
+            "video=Twin Camera",
+            "video=Twin Camera",
+        ]
+
+    def test_pnp_enumerator_uses_registry_capture_links(self) -> None:
+        records = [
+            {
+                "FriendlyName": "Twin Camera",
+                "InstanceId": r"USB\VID_05A3&PID_9230&MI_00\6&1A643E73&0&0000",
+            },
+        ]
+        links = [
+            (
+                r"@device_pnp_\\?\usb#vid_05a3&pid_9230&mi_00"
+                r"#6&1a643e73&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+            )
+        ]
+        with (
+            mock.patch("micecam.camera_manager._query_pnp_camera_records", return_value=records),
+            mock.patch("micecam.camera_manager._read_dshow_capture_links_from_registry", return_value=links),
+        ):
+            cameras = _list_devices_windows_pnp()
+
+        assert cameras[0].platform_id == f"video={links[0]}"
+
+    def test_dshow_unique_name_matches_ffmpeg_colon_replacement(self) -> None:
+        assert _dshow_unique_name_from_display_name(
+            r"@device:pnp:\\?\usb#vid_05a3&pid_9260&mi_00"
+        ) == r"@device_pnp_\\?\usb#vid_05a3&pid_9260&mi_00"
+
+    def test_com_enumerator_maps_moniker_display_names(self) -> None:
+        records = [
+            ("Twin Camera", r"@device:pnp:\\?\usb#one"),
+            ("Twin Camera", r"@device:pnp:\\?\usb#two"),
+        ]
+        with mock.patch(
+            "micecam.camera_manager._enumerate_dshow_video_monikers_com",
+            return_value=records,
+        ):
+            cameras = _list_devices_windows_com()
+
+        assert [c.name for c in cameras] == ["Twin Camera", "Twin Camera"]
+        assert [c.platform_id for c in cameras] == [
+            r"video=@device_pnp_\\?\usb#one",
+            r"video=@device_pnp_\\?\usb#two",
+        ]
+
+    def test_falls_back_to_com_when_ffmpeg_outputs_only_errors(self) -> None:
+        """COM exact monikers are preferred before PnP fallback."""
+        com = [
+            CameraInfo(0, "HD USB Camera", "video=@device_pnp_\\\\?\\usb#stable")
+        ]
+        with (
+            mock.patch(
+                "micecam.camera_manager._run_ffmpeg",
+                return_value="Could not enumerate video devices\nError opening input file dummy.",
+            ),
+            mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=com),
+            mock.patch("micecam.camera_manager._list_devices_windows_pnp") as pnp_mock,
+        ):
+            cameras = _list_devices_windows()
+
+        assert cameras == com
+        pnp_mock.assert_not_called()
 
 
 class TestCameraInfo:
@@ -383,7 +540,8 @@ class TestListDevicesFallback:
         assert second_call_args[1] == "dshow"
 
     @mock.patch("micecam.camera_manager._list_devices_windows_pnp", return_value=[])
-    def test_both_fail_returns_empty(self, _pnp: mock.Mock) -> None:
+    @mock.patch("micecam.camera_manager._list_devices_windows_com", return_value=[])
+    def test_both_fail_returns_empty(self, _com: mock.Mock, _pnp: mock.Mock) -> None:
         """When both styles fail, return empty list."""
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",

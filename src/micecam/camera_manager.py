@@ -162,8 +162,9 @@ def _list_devices_windows() -> list[CameraInfo]:
     friendly name (e.g. two identical USB cameras), prefer a stable
     ``@device_pnp_...`` DirectShow moniker over the fragile friendly-name
     ordinal.  The moniker can come from ffmpeg's "Alternative name" output
-    or from Windows PnP/DeviceClasses.  ``-video_device_number`` is kept
-    only as the last fallback for old/incomplete systems.
+    or from DirectShow COM enumeration.  PnP/DeviceClasses and
+    ``-video_device_number`` are kept only as fallbacks for old/incomplete
+    systems.
     """
     cameras: list[CameraInfo] = []
     for args in (
@@ -177,8 +178,17 @@ def _list_devices_windows() -> list[CameraInfo]:
             break
 
     if not cameras:
+        com_cameras = _list_devices_windows_com()
+        if com_cameras:
+            _suffix_duplicate_camera_names(com_cameras)
+            logger.info("Found %d dshow camera(s) via COM", len(com_cameras))
+            for c in com_cameras:
+                logger.debug("  [%d] %s -> %s", c.index, c.name, c.platform_id)
+            return com_cameras
+
         pnp_cameras = _list_devices_windows_pnp()
         if pnp_cameras:
+            _validate_or_fallback_pnp_ids(pnp_cameras)
             _suffix_duplicate_camera_names(pnp_cameras)
             logger.info("Found %d dshow camera(s) via PnP", len(pnp_cameras))
             for c in pnp_cameras:
@@ -188,7 +198,10 @@ def _list_devices_windows() -> list[CameraInfo]:
         return []
 
     if _needs_pnp_stable_ids(cameras):
-        cameras = _apply_pnp_stable_ids(cameras, _list_devices_windows_pnp())
+        stable_cameras = _list_devices_windows_com()
+        if not stable_cameras:
+            stable_cameras = _list_devices_windows_pnp()
+        cameras = _apply_pnp_stable_ids(cameras, stable_cameras)
 
     # Keep UI/output labels unique without changing the DirectShow ID.
     _suffix_duplicate_camera_names(cameras)
@@ -276,7 +289,7 @@ def _apply_pnp_stable_ids(
     cameras: list[CameraInfo],
     pnp_cameras: list[CameraInfo],
 ) -> list[CameraInfo]:
-    """Replace friendly-name duplicate IDs with stable PnP monikers when possible."""
+    """Replace friendly-name duplicate IDs with stable DirectShow monikers."""
     if not cameras or not pnp_cameras:
         return cameras
 
@@ -286,7 +299,7 @@ def _apply_pnp_stable_ids(
 
     occurrence: dict[str, int] = {}
     for cam in cameras:
-        if "video=@device_pnp_" in cam.platform_id.lower():
+        if _is_dshow_alternative_id(cam.platform_id):
             continue
         occurrence[cam.name] = occurrence.get(cam.name, 0) + 1
         candidates = pnp_by_name.get(cam.name, [])
@@ -294,10 +307,74 @@ def _apply_pnp_stable_ids(
         if candidate_index >= len(candidates):
             continue
         stable = candidates[candidate_index]
-        logger.info("Using stable PnP ID for camera '%s': %s", cam.name, stable.platform_id)
+        if not _is_dshow_alternative_id(stable.platform_id):
+            continue
+        if not _dshow_device_id_usable(stable.platform_id):
+            logger.warning(
+                "Stable DirectShow ID for camera '%s' is not usable; keeping "
+                "friendly-name ordinal fallback: %s",
+                cam.name,
+                stable.platform_id,
+            )
+            continue
+        logger.info("Using stable DirectShow ID for camera '%s': %s", cam.name, stable.platform_id)
         cam.platform_id = stable.platform_id
         cam.device_number = None
     return cameras
+
+
+def _validate_or_fallback_pnp_ids(cameras: list[CameraInfo]) -> None:
+    """Keep PnP monikers only when dshow can query options for them."""
+    for cam in cameras:
+        if not _is_dshow_alternative_id(cam.platform_id):
+            continue
+        if _dshow_device_id_usable(cam.platform_id):
+            continue
+        logger.warning(
+            "PnP ID for camera '%s' is not usable by dshow; falling back to "
+            "friendly-name opening: %s",
+            cam.name,
+            cam.platform_id,
+        )
+        escaped = cam.name.replace("\\", "\\\\").replace(":", "\\:")
+        cam.platform_id = f"video={escaped}"
+        cam.device_number = None
+
+
+def _dshow_device_id_usable(
+    platform_id: str,
+    device_number: int | None = None,
+) -> bool:
+    """Return True when DirectShow can enumerate options for a device id."""
+    output = _run_ffmpeg(
+        [
+            "-f", "dshow",
+            "-list_options", "true",
+            *(
+                ["-video_device_number", str(device_number)]
+                if device_number is not None else []
+            ),
+            "-i", platform_id,
+        ],
+        timeout=8,
+    )
+    lower = output.lower()
+    has_options = (
+        "directshow video device options" in lower
+        or "vcodec=" in lower
+        or "pixel_format=" in lower
+        or re.search(r"\bs=\d+x\d+\s+fps=", lower) is not None
+    )
+    if has_options:
+        return True
+    if output.strip():
+        logger.debug("dshow device id unusable for %s:\n%s", platform_id, output)
+    return False
+
+
+def _is_dshow_alternative_id(platform_id: str) -> bool:
+    """Return True for ffmpeg dshow alternative-name monikers."""
+    return platform_id.lower().startswith("video=@")
 
 
 def _needs_pnp_stable_ids(cameras: list[CameraInfo]) -> bool:
@@ -310,9 +387,330 @@ def _needs_pnp_stable_ids(cameras: list[CameraInfo]) -> bool:
     for cam in cameras:
         if name_counts[cam.name] <= 1:
             continue
-        if "video=@device_pnp_" not in cam.platform_id.lower():
+        if not _is_dshow_alternative_id(cam.platform_id):
             return True
     return False
+
+
+def _list_devices_windows_com() -> list[CameraInfo]:
+    """Enumerate DirectShow video devices through COM monikers.
+
+    FFmpeg's dshow "Alternative name" is derived from the same moniker
+    display name, with ':' replaced by '_'.  Querying COM directly gives us
+    the exact per-device identifier even when ffmpeg's device-list output is
+    unavailable or only contains duplicate friendly names.
+    """
+    records = _enumerate_dshow_video_monikers_com()
+    cameras: list[CameraInfo] = []
+    seen: set[str] = set()
+    for friendly_name, display_name in records:
+        if not display_name:
+            continue
+        alt_name = _dshow_unique_name_from_display_name(display_name)
+        platform_id = f"video={alt_name}"
+        seen_key = platform_id.lower()
+        if seen_key in seen:
+            continue
+        seen.add(seen_key)
+        cameras.append(CameraInfo(
+            index=len(cameras),
+            name=friendly_name or display_name,
+            platform_id=platform_id,
+        ))
+    return cameras
+
+
+def _dshow_unique_name_from_display_name(display_name: str) -> str:
+    """Convert an IMoniker display name to ffmpeg's dshow alternative name."""
+    return display_name.replace(":", "_")
+
+
+def _enumerate_dshow_video_monikers_com() -> list[tuple[str, str]]:
+    """Return ``(friendly_name, moniker_display_name)`` for dshow video devices."""
+    if platform.system() != "Windows":
+        return []
+
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+    except Exception:
+        logger.debug("ctypes COM support is unavailable", exc_info=True)
+        return []
+
+    HRESULT = ctypes.c_long
+    ULONG = wintypes.ULONG
+    DWORD = wintypes.DWORD
+    WORD = wintypes.WORD
+    USHORT = wintypes.USHORT
+    WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+
+    S_OK = 0
+    S_FALSE = 1
+    RPC_E_CHANGED_MODE = 0x80010106
+    CLSCTX_INPROC_SERVER = 0x1
+    VT_EMPTY = 0
+    VT_BSTR = 8
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", DWORD),
+            ("Data2", WORD),
+            ("Data3", WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class VARIANT_UNION(ctypes.Union):
+        _fields_ = [
+            ("bstrVal", ctypes.c_void_p),
+            ("byref", ctypes.c_void_p),
+        ]
+
+    class VARIANT(ctypes.Structure):
+        _anonymous_ = ("data",)
+        _fields_ = [
+            ("vt", USHORT),
+            ("wReserved1", USHORT),
+            ("wReserved2", USHORT),
+            ("wReserved3", USHORT),
+            ("data", VARIANT_UNION),
+        ]
+
+    def guid(value: str) -> GUID:
+        parsed = uuid.UUID(value.strip("{}"))
+        return GUID(
+            parsed.time_low,
+            parsed.time_mid,
+            parsed.time_hi_version,
+            (ctypes.c_ubyte * 8).from_buffer_copy(parsed.bytes[8:]),
+        )
+
+    def succeeded(hr: int) -> bool:
+        return ctypes.c_long(hr).value >= 0
+
+    def hresult_u32(hr: int) -> int:
+        return ctypes.c_ulong(hr).value & 0xFFFFFFFF
+
+    def com_method(ptr: ctypes.c_void_p, index: int, *argtypes: object) -> object:
+        vtable = ctypes.cast(
+            ptr,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+        ).contents
+        return WINFUNCTYPE(HRESULT, ctypes.c_void_p, *argtypes)(vtable[index])
+
+    def release(ptr: ctypes.c_void_p | None) -> None:
+        if not ptr:
+            return
+        release_method = com_method(ptr, 2)
+        release_method(ptr)
+
+    ole32 = ctypes.OleDLL("ole32")
+    oleaut32 = ctypes.OleDLL("oleaut32")
+
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = HRESULT
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(GUID),
+        ctypes.c_void_p,
+        DWORD,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = HRESULT
+    ole32.CreateBindCtx.argtypes = [DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CreateBindCtx.restype = HRESULT
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+    oleaut32.VariantClear.argtypes = [ctypes.POINTER(VARIANT)]
+    oleaut32.VariantClear.restype = HRESULT
+
+    clsid_system_device_enum = guid("{62BE5D10-60EB-11D0-BD3B-00A0C911CE86}")
+    clsid_video_input_device_category = guid("{860BB310-5D01-11D0-BD3B-00A0C911CE86}")
+    iid_icreate_dev_enum = guid("{29840822-5B84-11D0-BD3B-00A0C911CE86}")
+    iid_iproperty_bag = guid("{55272A00-42CB-11CE-8135-00AA004BB851}")
+
+    com_initialized = False
+    dev_enum = ctypes.c_void_p()
+    enum_moniker = ctypes.c_void_p()
+    bind_ctx = ctypes.c_void_p()
+    records: list[tuple[str, str]] = []
+
+    try:
+        hr = ole32.CoInitialize(None)
+        if hresult_u32(hr) == RPC_E_CHANGED_MODE:
+            logger.debug("COM already initialized with a different apartment model")
+        elif not succeeded(hr):
+            logger.debug("CoInitialize failed: 0x%08x", hresult_u32(hr))
+            return []
+        else:
+            com_initialized = True
+
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid_system_device_enum),
+            None,
+            CLSCTX_INPROC_SERVER,
+            ctypes.byref(iid_icreate_dev_enum),
+            ctypes.byref(dev_enum),
+        )
+        if not succeeded(hr) or not dev_enum:
+            logger.debug("CoCreateInstance(ICreateDevEnum) failed: 0x%08x", hresult_u32(hr))
+            return []
+
+        create_class_enum = com_method(
+            dev_enum,
+            3,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+            DWORD,
+        )
+        hr = create_class_enum(
+            dev_enum,
+            ctypes.byref(clsid_video_input_device_category),
+            ctypes.byref(enum_moniker),
+            0,
+        )
+        if hr == S_FALSE or not enum_moniker:
+            return []
+        if not succeeded(hr):
+            logger.debug("CreateClassEnumerator(video) failed: 0x%08x", hresult_u32(hr))
+            return []
+
+        hr = ole32.CreateBindCtx(0, ctypes.byref(bind_ctx))
+        if not succeeded(hr) or not bind_ctx:
+            logger.debug("CreateBindCtx failed: 0x%08x", hresult_u32(hr))
+            return []
+
+        enum_next = com_method(
+            enum_moniker,
+            3,
+            ULONG,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ULONG),
+        )
+
+        while True:
+            moniker = ctypes.c_void_p()
+            fetched = ULONG(0)
+            hr = enum_next(enum_moniker, 1, ctypes.byref(moniker), ctypes.byref(fetched))
+            if hr != S_OK or not moniker:
+                break
+            try:
+                display_name = _read_dshow_moniker_display_name(
+                    moniker,
+                    bind_ctx,
+                    com_method,
+                    ole32.CoTaskMemFree,
+                )
+                friendly_name = _read_dshow_moniker_property(
+                    moniker,
+                    "FriendlyName",
+                    iid_iproperty_bag,
+                    com_method,
+                    oleaut32.VariantClear,
+                    VT_EMPTY,
+                    VT_BSTR,
+                    VARIANT,
+                )
+                if display_name:
+                    records.append((friendly_name, display_name))
+            finally:
+                release(moniker)
+    except Exception:
+        logger.debug("DirectShow COM camera enumeration failed", exc_info=True)
+        return []
+    finally:
+        release(bind_ctx)
+        release(enum_moniker)
+        release(dev_enum)
+        if com_initialized:
+            ole32.CoUninitialize()
+
+    return records
+
+
+def _read_dshow_moniker_display_name(
+    moniker: object,
+    bind_ctx: object,
+    com_method: object,
+    co_task_mem_free: object,
+) -> str:
+    """Read an IMoniker display name and free COM-allocated memory."""
+    import ctypes
+
+    get_display_name = com_method(
+        moniker,
+        20,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    name_ptr = ctypes.c_void_p()
+    hr = get_display_name(moniker, bind_ctx, None, ctypes.byref(name_ptr))
+    if ctypes.c_long(hr).value < 0 or not name_ptr:
+        return ""
+    try:
+        return ctypes.wstring_at(name_ptr.value)
+    finally:
+        co_task_mem_free(name_ptr)
+
+
+def _read_dshow_moniker_property(
+    moniker: object,
+    property_name: str,
+    iid_iproperty_bag: object,
+    com_method: object,
+    variant_clear: object,
+    vt_empty: int,
+    vt_bstr: int,
+    variant_type: object,
+) -> str:
+    """Read a string property from an IMoniker's IPropertyBag."""
+    import ctypes
+
+    property_bag = ctypes.c_void_p()
+    bind_to_storage = com_method(
+        moniker,
+        9,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(type(iid_iproperty_bag)),
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    hr = bind_to_storage(
+        moniker,
+        None,
+        None,
+        ctypes.byref(iid_iproperty_bag),
+        ctypes.byref(property_bag),
+    )
+    if ctypes.c_long(hr).value < 0 or not property_bag:
+        return ""
+
+    try:
+        read_property = com_method(
+            property_bag,
+            3,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(variant_type),
+            ctypes.c_void_p,
+        )
+        value = variant_type()
+        value.vt = vt_bstr
+        try:
+            hr = read_property(property_bag, property_name, ctypes.byref(value), None)
+            if ctypes.c_long(hr).value < 0:
+                return ""
+            if value.vt != vt_bstr or not value.bstrVal:
+                return ""
+            return ctypes.wstring_at(value.bstrVal)
+        finally:
+            if value.vt != vt_empty:
+                variant_clear(ctypes.byref(value))
+    finally:
+        release_property_bag = com_method(property_bag, 2)
+        release_property_bag(property_bag)
 
 
 def _list_devices_windows_pnp() -> list[CameraInfo]:
@@ -324,19 +722,32 @@ def _list_devices_windows_pnp() -> list[CameraInfo]:
     capture_links = _read_dshow_capture_links_from_registry()
     cameras: list[CameraInfo] = []
     seen: set[str] = set()
+    seen_instances: set[str] = set()
     for rec in records:
         name = rec.get("FriendlyName") or rec.get("Name") or ""
         instance_id = rec.get("InstanceId") or rec.get("PNPDeviceID") or ""
         if not name or not instance_id:
             continue
+        instance_key = instance_id.strip().lower()
+        if instance_key in seen_instances:
+            continue
+        seen_instances.add(instance_key)
 
         alt = _find_capture_link_for_instance(instance_id, capture_links)
-        if alt is None:
-            alt = _dshow_alt_from_instance_id(instance_id)
-        platform_id = f"video={alt}"
-        if platform_id in seen:
-            continue
-        seen.add(platform_id)
+        if alt is not None:
+            platform_id = f"video={alt}"
+            if platform_id in seen:
+                continue
+            seen.add(platform_id)
+        else:
+            logger.warning(
+                "No DirectShow capture link found for PnP camera '%s' (%s); "
+                "using friendly-name ordinal fallback.",
+                name,
+                instance_id,
+            )
+            escaped = name.replace("\\", "\\\\").replace(":", "\\:")
+            platform_id = f"video={escaped}"
         cameras.append(CameraInfo(
             index=len(cameras),
             name=name,
@@ -426,12 +837,6 @@ def _dshow_alt_from_registry_child(child: str) -> str | None:
     if f"#{{{DSHOW_CAPTURE_GUID}}}".lower() not in body.lower():
         return None
     return f"@device_pnp_\\\\?\\{body.lower()}\\global"
-
-
-def _dshow_alt_from_instance_id(instance_id: str) -> str:
-    """Construct the usual DirectShow capture moniker from a PnP instance ID."""
-    body = instance_id.strip().replace("\\", "#").lower()
-    return f"@device_pnp_\\\\?\\{body}#{{{DSHOW_CAPTURE_GUID}}}\\global"
 
 
 def _find_capture_link_for_instance(
