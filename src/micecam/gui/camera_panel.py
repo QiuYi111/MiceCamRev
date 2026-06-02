@@ -31,11 +31,23 @@ from micecam.recorder import Recorder
 
 logger = logging.getLogger(__name__)
 
-# Preview dimensions — 1080p ceiling so we can find a resolution whose
-# native fps range includes ≤30 (many cameras only offer 120 fps at QVGA/VGA).
+# Preview display size in the GUI.
+PREVIEW_DISPLAY_W = 640
+PREVIEW_DISPLAY_H = 480
+
+# Preview capture ceiling. This is separate from the GUI display size because
+# some cameras only expose stable <=30 fps modes at larger resolutions.
 PREVIEW_MAX_W = 1920
 PREVIEW_MAX_H = 1080
 PREVIEW_PREFERRED_FPS = 15
+
+
+def _fit_preview_output_size(width: int, height: int) -> tuple[int, int]:
+    """Return a GUI-sized output while preserving the capture aspect ratio."""
+    if width <= PREVIEW_DISPLAY_W and height <= PREVIEW_DISPLAY_H:
+        return width, height
+    scale = min(PREVIEW_DISPLAY_W / width, PREVIEW_DISPLAY_H / height)
+    return max(1, int(width * scale)), max(1, int(height * scale))
 
 
 # ── Preview capture thread ──────────────────────────────────────────
@@ -70,6 +82,11 @@ class PreviewThread(QtCore.QThread):
         ffmpeg = get_ffmpeg_path()
         system = sys.platform
         preview_w, preview_h = self.resolution
+        output_w, output_h = _fit_preview_output_size(preview_w, preview_h)
+        scale_args = (
+            ["-vf", f"scale={output_w}:{output_h}"]
+            if (output_w, output_h) != (preview_w, preview_h) else []
+        )
 
         if system == "darwin":
             input_args = [
@@ -113,6 +130,7 @@ class PreviewThread(QtCore.QThread):
         cmd = [
             ffmpeg, "-hide_banner", "-loglevel", "error",
             *input_args,
+            *scale_args,
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
             "-an",
@@ -131,7 +149,7 @@ class PreviewThread(QtCore.QThread):
             self.preview_error.emit("ffmpeg not found")
             return
 
-        frame_size = preview_w * preview_h * 3  # RGB24 = 3 bytes/pixel
+        frame_size = output_w * output_h * 3  # RGB24 = 3 bytes/pixel
         first_frame = True
         stdout = self._process.stdout
         while self._running and self._process.poll() is None:
@@ -148,7 +166,7 @@ class PreviewThread(QtCore.QThread):
 
             # Build QImage from raw RGB24 data
             image = QtGui.QImage(
-                raw, preview_w, preview_h, preview_w * 3,
+                raw, output_w, output_h, output_w * 3,
                 QtGui.QImage.Format.Format_RGB888,
             )
             if not image.isNull():
@@ -259,7 +277,7 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         # --- Preview ---
         self._preview_label = QtWidgets.QLabel()
-        self._preview_label.setFixedSize(PREVIEW_MAX_W, PREVIEW_MAX_H)
+        self._preview_label.setFixedSize(PREVIEW_DISPLAY_W, PREVIEW_DISPLAY_H)
         self._preview_label.setStyleSheet(
             "QLabel { background: #1a1a1a; border: 1px solid #444; "
             "color: #666; font-size: 14px; }"
