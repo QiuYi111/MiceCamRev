@@ -6,6 +6,8 @@ Supports ``--check`` flag for smoke-testing in CI without launching the GUI.
 import logging
 import sys
 
+from micecam.utils.platform import default_settings_path
+
 
 def _run_smoke_test() -> int:
     """Verify all modules import and critical objects are functional."""
@@ -161,11 +163,17 @@ def _run_smoke_test() -> int:
 
 def main() -> None:
     """Entry point for the ``micecam`` console script."""
+    log_path = default_settings_path().with_name("micecam.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, encoding="utf-8"),
+        ],
     )
+    logging.info("Log file: %s", log_path)
 
     if "--check" in sys.argv:
         code = _run_smoke_test()

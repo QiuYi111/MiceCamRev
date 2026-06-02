@@ -22,7 +22,11 @@ from typing import Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from micecam.camera_manager import CameraInfo, get_ffmpeg_path
+from micecam.camera_manager import (
+    CameraInfo,
+    choose_camera_input_codec,
+    get_ffmpeg_path,
+)
 from micecam.recorder import Recorder
 
 logger = logging.getLogger(__name__)
@@ -106,7 +110,7 @@ class PreviewThread(QtCore.QThread):
             "-an",
             "-",
         ]
-        logger.debug("Preview cmd: %s", " ".join(cmd))
+        logger.info("Preview cmd: %s", subprocess.list2cmdline(cmd))
 
         try:
             self._process = subprocess.Popen(
@@ -488,17 +492,23 @@ class CameraPanel(QtWidgets.QGroupBox):
     # ── Preview ──────────────────────────────────────────────────────
 
     def _start_preview(self, cam: CameraInfo) -> None:
+        if cam is None:
+            return
         self._stop_preview()
         preview_res, preview_fps = self._choose_preview_mode(cam)
-        logger.debug(
-            "Preview using %dx%d @ %d fps for %s (native=%s)",
-            preview_res[0], preview_res[1], preview_fps, cam.name, cam.native_codec,
+        input_codec = choose_camera_input_codec(cam, preview_res, preview_fps)
+        if not input_codec and not cam.mode_codecs:
+            input_codec = cam.native_codec
+        logger.info(
+            "Preview using %dx%d @ %d fps for %s id=%r device_number=%r input_codec=%s",
+            preview_res[0], preview_res[1], preview_fps,
+            cam.name, cam.platform_id, cam.device_number, input_codec,
         )
         self._preview_thread = PreviewThread(
             cam.platform_id,
             fps=preview_fps,
             resolution=preview_res,
-            native_codec=cam.native_codec,
+            native_codec=input_codec,
             device_number=cam.device_number,
             parent=self,
         )
@@ -580,11 +590,19 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         output_dir = Path(self._output_edit.text())
         cam = self._current_camera
+        input_codec = choose_camera_input_codec(cam, res, fps)
+        if not input_codec and not cam.mode_codecs:
+            input_codec = cam.native_codec
+        logger.info(
+            "Recording config for %s: %dx%d @ %d fps input_codec=%s id=%r device_number=%r",
+            cam.name, res[0], res[1], fps,
+            input_codec, cam.platform_id, cam.device_number,
+        )
         return Recorder(
             camera_id=cam.platform_id,
             camera_name=cam.name,
             output_dir=output_dir,
-            native_codec=cam.native_codec,
+            native_codec=input_codec,
             camera_device_number=cam.device_number,
         )
 

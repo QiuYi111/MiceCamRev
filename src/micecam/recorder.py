@@ -131,7 +131,7 @@ class Recorder:
             encoder="copy" if use_passthrough else encoder,
             output_path=self._output_path,
         )
-        logger.debug("ffmpeg command: %s", " ".join(cmd))
+        logger.info("ffmpeg command: %s", subprocess.list2cmdline(cmd))
 
         # Launch ffmpeg — send stdin as PIPE so we can write 'q' to stop gracefully
         self._process = subprocess.Popen(

@@ -54,6 +54,9 @@ class CameraInfo:
     # Per-resolution FPS limits: {(w,h): [fps_values]}.
     # Populated on Windows via -list_options; empty on macOS/Linux (fallback to probing).
     resolution_fps: dict[tuple[int, int], list[int]] = field(default_factory=dict)
+    # Per-mode input codecs: {(w,h,fps): ["h264", "mjpeg", ...]}.
+    # DirectShow cameras often expose different codecs for 30 fps vs 60 fps.
+    mode_codecs: dict[tuple[int, int, int], list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -502,11 +505,38 @@ def _probe_capability(platform_id: str, width: int, height: int,
     return success
 
 
+_PASSTHROUGH_CODEC_PRIORITY = ("h264", "hevc", "mjpeg")
+
 # Compressed codecs that can be stream-copied into MP4 without re-encoding.
-_PASSTHROUGH_CODECS = frozenset({"mjpeg", "h264", "hevc"})
+_PASSTHROUGH_CODECS = frozenset(_PASSTHROUGH_CODEC_PRIORITY)
 
 
-def _query_caps_windows(platform_id: str, device_number: int | None = None) -> tuple[list[tuple[int, int]], list[int], str, dict[tuple[int, int], list[int]]]:
+def choose_camera_input_codec(
+    camera: CameraInfo,
+    resolution: tuple[int, int],
+    fps: int,
+) -> str:
+    """Return the DirectShow input codec that supports a specific mode."""
+    codecs = camera.mode_codecs.get((resolution[0], resolution[1], fps), [])
+    for codec in _PASSTHROUGH_CODEC_PRIORITY:
+        if codec in codecs:
+            return codec
+    for codec in codecs:
+        if codec in _PASSTHROUGH_CODECS:
+            return codec
+    return ""
+
+
+def _query_caps_windows(
+    platform_id: str,
+    device_number: int | None = None,
+) -> tuple[
+    list[tuple[int, int]],
+    list[int],
+    str,
+    dict[tuple[int, int], list[int]],
+    dict[tuple[int, int, int], list[str]],
+]:
     """Query supported resolutions, framerates & native codec via ``-list_options``.
 
     Much faster than probing — ffmpeg directly enumerates the dshow pin caps.
@@ -535,6 +565,7 @@ def _query_caps_windows(platform_id: str, device_number: int | None = None) -> t
     # Collect per-format capabilities: {(w,h): set(fps)} for each codec type
     mjpeg_res_fps: dict[tuple[int, int], set[int]] = {}
     raw_res_fps: dict[tuple[int, int], set[int]] = {}
+    mode_codecs: dict[tuple[int, int, int], set[str]] = {}
     vcodecs: set[str] = set()
     pixel_formats: set[str] = set()
 
@@ -553,6 +584,12 @@ def _query_caps_windows(platform_id: str, device_number: int | None = None) -> t
         elif codec_kind == "pixel_format":
             pixel_formats.add(codec_value)
 
+        mode_codec = ""
+        if codec_kind == "vcodec":
+            mode_codec = codec_value
+        elif codec_kind == "pixel_format":
+            mode_codec = "mjpeg" if codec_value == "mjpeg" else codec_value
+
         # Determine whether this line describes a passthrough-capable MJPEG pin.
         # Old ffmpeg builds use "pixel_format=mjpeg"; new builds use "vcodec=mjpeg".
         # Both mean the camera can deliver hardware-compressed MJPEG frames.
@@ -569,6 +606,8 @@ def _query_caps_windows(platform_id: str, device_number: int | None = None) -> t
             fps = int(float(match.group(3)))
             all_resolutions.add((w, h))
             all_framerates.add(fps)
+            if mode_codec:
+                mode_codecs.setdefault((w, h, fps), set()).add(mode_codec)
             # Store per-codec: MJPEG pins support higher FPS than raw pins
             if is_mjpeg_pin:
                 mjpeg_res_fps.setdefault((w, h), set()).add(fps)
@@ -596,11 +635,15 @@ def _query_caps_windows(platform_id: str, device_number: int | None = None) -> t
 
     res_list = sorted(all_resolutions, key=lambda r: (-r[0], -r[1]))  # highest first
     fps_list = sorted(all_framerates, reverse=True)
+    mode_codec_map = {
+        mode: sorted(codecs)
+        for mode, codecs in mode_codecs.items()
+    }
     logger.info("dshow caps for %s: res=%s fps=%s native=%s",
                 platform_id, res_list, fps_list, native_codec)
     for (rw, rh), rfps in res_fps_map.items():
         logger.debug("  %dx%d → %s fps", rw, rh, rfps)
-    return res_list, fps_list, native_codec, res_fps_map
+    return res_list, fps_list, native_codec, res_fps_map, mode_codec_map
 
 
 def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
@@ -612,7 +655,7 @@ def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
     On macOS/Linux, falls back to probe-each-combo (slower but works).
     """
     if platform_name == "Windows":
-        res, fps, native, res_fps = _query_caps_windows(
+        res, fps, native, res_fps, mode_codecs = _query_caps_windows(
             camera.platform_id, camera.device_number,
         )
         if res:
@@ -620,6 +663,7 @@ def _query_camera_caps(camera: CameraInfo, platform_name: str) -> None:
             camera.supported_framerates = fps
             camera.native_codec = native
             camera.resolution_fps = res_fps
+            camera.mode_codecs = mode_codecs
             return
         # Fall through to probing if list_options gave nothing
         logger.warning("_query_caps_windows empty, falling back to probing")

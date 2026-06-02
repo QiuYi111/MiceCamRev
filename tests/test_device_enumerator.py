@@ -18,6 +18,7 @@ from micecam.camera_manager import (
     _list_devices_windows,
     _query_caps_windows,
     _run_ffmpeg,
+    choose_camera_input_codec,
     get_preferred_encoder,
 )
 
@@ -90,6 +91,14 @@ SAMPLE_LIST_OPTIONS_VCODEC = """
 [dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=640x480 fps=30 max s=640x480 fps=30
 [dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=320x240 fps=30 max s=320x240 fps=30
 [dshow @ 0000021b8a9e2c00]   pixel_format=yuyv422  min s=640x480 fps=30 max s=640x480 fps=30
+"""
+
+SAMPLE_LIST_OPTIONS_MIXED_CODECS = """
+[dshow @ 0000021b8a9e2c00] DirectShow video device options (from video devices)
+[dshow @ 0000021b8a9e2c00]  Pin "Capture" (alternative pin name "0")
+[dshow @ 0000021b8a9e2c00]   vcodec=h264   min s=1920x1080 fps=30 max s=1920x1080 fps=30
+[dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=1920x1080 fps=60 max s=1920x1080 fps=60
+[dshow @ 0000021b8a9e2c00]   vcodec=mjpeg  min s=800x600 fps=60 max s=800x600 fps=60
 """
 
 # Camera with no compressed codec, only raw pixel formats
@@ -392,7 +401,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_OUTPUT,
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
 
         assert (1920, 1080) in res
         assert (640, 480) in res
@@ -415,7 +424,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_DECIMAL_FPS,
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
 
         assert (1920, 1080) in res
         assert (640, 480) in res
@@ -433,7 +442,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_SINGLE,
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
 
         assert res == [(640, 480)]
         assert fps == [30]
@@ -447,7 +456,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value="",
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
         assert res == []
         assert fps == []
         assert native == ""
@@ -471,7 +480,7 @@ class TestQueryCapsWindows:
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_VCODEC,
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
 
         assert (1280, 720) in res
         assert (640, 480) in res
@@ -485,13 +494,38 @@ class TestQueryCapsWindows:
         assert (640, 480) in res_fps
         assert (320, 240) in res_fps
 
+    def test_mode_specific_codec_selection(self) -> None:
+        """Do not use a camera-wide h264 codec for modes that require mjpeg."""
+        with mock.patch(
+            "micecam.camera_manager._run_ffmpeg",
+            return_value=SAMPLE_LIST_OPTIONS_MIXED_CODECS,
+        ):
+            res, fps, native, res_fps, mode_codecs = _query_caps_windows("video=Test")
+
+        cam = CameraInfo(
+            index=0,
+            name="Mixed Codec Camera",
+            platform_id="video=Test",
+            supported_resolutions=res,
+            supported_framerates=fps,
+            native_codec=native,
+            resolution_fps=res_fps,
+            mode_codecs=mode_codecs,
+        )
+
+        assert native == "h264"
+        assert choose_camera_input_codec(cam, (1920, 1080), 30) == "h264"
+        assert choose_camera_input_codec(cam, (1920, 1080), 60) == "mjpeg"
+        assert choose_camera_input_codec(cam, (800, 600), 60) == "mjpeg"
+        assert choose_camera_input_codec(cam, (800, 600), 30) == ""
+
     def test_raw_only_no_passthrough(self) -> None:
         """Camera with only raw pixel formats — no passthrough codec."""
         with mock.patch(
             "micecam.camera_manager._run_ffmpeg",
             return_value=SAMPLE_LIST_OPTIONS_RAW_ONLY,
         ):
-            res, fps, native, res_fps = _query_caps_windows('video=Test')
+            res, fps, native, res_fps, _mode_codecs = _query_caps_windows('video=Test')
 
         assert (640, 480) in res
         assert (320, 240) in res
