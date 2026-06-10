@@ -222,7 +222,7 @@ class TimestampWriter:
                 else:
                     break
 
-        first_pts = frame_pts_times[0]
+        steady_start_s = self.steady_start / 1e9
         intervals = [
             b - a for a, b in zip(frame_pts_times, frame_pts_times[1:])
             if b > a
@@ -239,7 +239,7 @@ class TimestampWriter:
             f.write("# timing_model: per_frame_native_pts\n")
             f.write("# timestamp_source: ffmpeg_demuxer_pkt_pts_time\n")
             f.write("# pts_time_base: seconds\n")
-            f.write("# wall_mapping: wall_start + (pts - first_pts)\n")
+            f.write("# wall_mapping: wall_start + (pts - steady_start_ns / 1e9)\n")
             f.write("\n")
 
             for frame_idx, pts in enumerate(frame_pts_times):
@@ -249,15 +249,22 @@ class TimestampWriter:
                     if frame_idx + 1 < len(frame_pts_times)
                     else pts + fallback_interval
                 )
-                start_s = max(0.0, pts - first_pts)
-                end_s = max(start_s + 0.001, next_pts - first_pts)
+                start_s = max(0.0, pts - steady_start_s)
+                end_s = max(start_s + 0.001, next_pts - steady_start_s)
+                actual_wall = self.wall_start + start_s
+                whole_sec = int(actual_wall)
+                nanos = int((actual_wall - whole_sec) * 1e9)
+                ts_str = datetime.fromtimestamp(
+                    whole_sec, tz=timezone.utc
+                ).strftime(self._time_fmt)
+                ts_full = f"{ts_str}.{nanos:09d}"
 
                 f.write(
                     f"{frame_num}\n"
                     f"{self._seconds_to_srt_timecode(start_s)} --> "
                     f"{self._seconds_to_srt_timecode(end_s)}\n"
                     f"pts={pts:.9f}  pts_offset={start_s:.9f}  "
-                    f"frame={frame_num}\n\n"
+                    f"ts={ts_full}  frame={frame_num}\n\n"
                 )
 
         logger.info(
