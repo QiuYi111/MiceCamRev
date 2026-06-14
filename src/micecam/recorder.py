@@ -276,15 +276,9 @@ class Recorder:
             wall_duration,
         )
 
-        # Finalize SRT timestamps — QPC primary, PTS fallback
+        # Finalize SRT timestamps — PTS primary, QPC recorded for diagnostics
         if self._ts_writer:
-            if self._frame_qpc_times and len(self._frame_qpc_times) >= len(self._frame_pts_times) * 0.5:
-                # QPC coverage >= 50%: use QPC-primary mode
-                self._ts_writer.finalize_qpc_times(
-                    self._frame_pts_times, self._frame_qpc_times,
-                )
-            elif self._frame_pts_times:
-                # No QPC: fall back to PTS-only (backward compatible)
+            if self._frame_pts_times:
                 self._ts_writer.finalize_pts_times(self._frame_pts_times)
             else:
                 self._ts_writer.finalize(self.duration_seconds, self.frame_count)
@@ -689,13 +683,9 @@ class Recorder:
             },
             "experimental_timing": {
                 "source": (
-                    "qpc_primary_pts_fallback"
-                    if self._frame_qpc_times
-                    else (
-                        "ffmpeg_demuxer_pkt_pts_time"
-                        if self._frame_pts_times
-                        else "monotonic_clock"
-                    )
+                    "ffmpeg_demuxer_pkt_pts_time"
+                    if self._frame_pts_times
+                    else "monotonic_clock"
                 ),
                 "duration_seconds": experimental_duration,
                 "frame_count": frame_count,
@@ -703,18 +693,14 @@ class Recorder:
                 "mean_fps": real_fps,
                 "qpc_frame_count": len(self._frame_qpc_times) if self._frame_qpc_times else 0,
                 "frame_timestamps": (
-                    "per_frame_qpc"
-                    if self._frame_qpc_times
-                    else (
-                        "per_frame"
-                        if self._frame_pts_times
-                        else "uniform_estimate_over_monotonic_duration"
-                    )
+                    "per_frame"
+                    if self._frame_pts_times
+                    else "uniform_estimate_over_monotonic_duration"
                 ),
                 "note": (
-                    "SRT timestamps use ffmpeg demuxer packet PTS when "
-                    "available. wall_start in the SRT header provides the "
-                    "absolute-time anchor."
+                    "SRT timestamps use PTS as primary (sensor crystal grid). "
+                    "QPC recorded per-frame for diagnostics and drop detection. "
+                    "wall_start in the SRT header provides the absolute-time anchor."
                 ),
             },
             "container_timing": {
