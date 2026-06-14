@@ -69,6 +69,7 @@ class Recorder:
         self.duration_seconds: float = 0.0
         self.frame_count: int = 0
         self._frame_pts_times: list[float] = []
+        self._frame_qpc_times: list[float] = []   # perf_counter at debug_ts read
         self._requested_resolution: tuple[int, int] | None = None
         self._requested_fps: int | None = None
         self._requested_codec: str = ""
@@ -109,6 +110,7 @@ class Recorder:
         self._requested_fps = fps
         self._requested_codec = codec
         self._frame_pts_times = []
+        self._frame_qpc_times = []
         self._failure_reason = None
         self._stderr_tail = []
         self._stderr_error_lines = []
@@ -274,9 +276,15 @@ class Recorder:
             wall_duration,
         )
 
-        # Finalize SRT timestamps
+        # Finalize SRT timestamps — QPC primary, PTS fallback
         if self._ts_writer:
-            if self._frame_pts_times:
+            if self._frame_qpc_times and len(self._frame_qpc_times) >= len(self._frame_pts_times) * 0.5:
+                # QPC coverage >= 50%: use QPC-primary mode
+                self._ts_writer.finalize_qpc_times(
+                    self._frame_pts_times, self._frame_qpc_times,
+                )
+            elif self._frame_pts_times:
+                # No QPC: fall back to PTS-only (backward compatible)
                 self._ts_writer.finalize_pts_times(self._frame_pts_times)
             else:
                 self._ts_writer.finalize(self.duration_seconds, self.frame_count)
@@ -547,7 +555,13 @@ class Recorder:
                 pass
 
     def _record_frame_timestamp(self, line: str) -> None:
-        """Capture per-frame native PTS timestamps emitted by ffmpeg debug_ts."""
+        """Capture per-frame native PTS timestamps emitted by ffmpeg debug_ts.
+
+        Records both the ffmpeg demuxer PTS and the PC QPC
+        (``time.perf_counter()``) at the moment the debug line is read.
+        QPC is the primary timestamp for cross-modal alignment because
+        it is directly in the master clock domain.
+        """
         match = re.search(r"\bpkt_pts_time:([+-]?\d+(?:\.\d+)?)", line)
         if not match:
             return
@@ -558,6 +572,7 @@ class Recorder:
         if self._frame_pts_times and pts_time <= self._frame_pts_times[-1]:
             return
         self._frame_pts_times.append(pts_time)
+        self._frame_qpc_times.append(time.perf_counter())
 
     def _probe_output_video(self) -> tuple[float | None, int | None]:
         """Return final MP4 duration and video packet count when available."""
@@ -674,18 +689,27 @@ class Recorder:
             },
             "experimental_timing": {
                 "source": (
-                    "ffmpeg_demuxer_pkt_pts_time"
-                    if self._frame_pts_times
-                    else "monotonic_clock"
+                    "qpc_primary_pts_fallback"
+                    if self._frame_qpc_times
+                    else (
+                        "ffmpeg_demuxer_pkt_pts_time"
+                        if self._frame_pts_times
+                        else "monotonic_clock"
+                    )
                 ),
                 "duration_seconds": experimental_duration,
                 "frame_count": frame_count,
                 "ffmpeg_progress_frame_count": progress_frames,
                 "mean_fps": real_fps,
+                "qpc_frame_count": len(self._frame_qpc_times) if self._frame_qpc_times else 0,
                 "frame_timestamps": (
-                    "per_frame"
-                    if self._frame_pts_times
-                    else "uniform_estimate_over_monotonic_duration"
+                    "per_frame_qpc"
+                    if self._frame_qpc_times
+                    else (
+                        "per_frame"
+                        if self._frame_pts_times
+                        else "uniform_estimate_over_monotonic_duration"
+                    )
                 ),
                 "note": (
                     "SRT timestamps use ffmpeg demuxer packet PTS when "

@@ -272,6 +272,154 @@ class TimestampWriter:
             len(frame_pts_times),
         )
 
+    def finalize_qpc_times(
+        self,
+        frame_pts_times: list[float],
+        frame_qpc_times: list[float],
+    ) -> None:
+        """Generate SRT entries with QPC as the primary timestamp.
+
+        Each frame records both the ffmpeg demuxer PTS and the PC
+        ``perf_counter()`` (QPC) captured when the debug_ts line was read.
+        QPC is used as the primary time axis because it is directly in the
+        master clock domain, enabling cross-modal alignment with IMU and
+        motor timestamps without any fitting or mapping.
+
+        The PTS is retained as a fallback and for debugging (e.g. detecting
+        frame drops by comparing QPC intervals to expected PTS cadence).
+        """
+        if self._file is None:
+            return
+
+        self._file.close()
+        if not frame_pts_times or not frame_qpc_times:
+            logger.warning(
+                "No QPC timestamps recorded, falling back to PTS-only SRT"
+            )
+            if frame_pts_times:
+                self.finalize_pts_times(frame_pts_times)
+            return
+
+        n_pts = len(frame_pts_times)
+        n_qpc = len(frame_qpc_times)
+        n = min(n_pts, n_qpc)
+
+        if n == 0:
+            logger.warning("No frame timestamps recorded, SRT will be empty")
+            return
+
+        header_lines: list[str] = []
+        with open(self._path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    header_lines.append(line.rstrip("\n"))
+                else:
+                    break
+
+        steady_start_s = self.steady_start / 1e9
+
+        # Compute fallback interval from PTS (for last-frame end time)
+        pts_intervals = [
+            b - a for a, b in zip(frame_pts_times, frame_pts_times[1:])
+            if b > a
+        ]
+        fallback_interval = (
+            sorted(pts_intervals)[len(pts_intervals) // 2]
+            if pts_intervals
+            else 1.0 / 30.0
+        )
+
+        # Detect timing model for header
+        qpc_present = n_qpc >= n_pts * 0.9  # >=90% coverage = QPC primary
+        pts_first = frame_pts_times[0] if frame_pts_times else 0.0
+
+        with open(self._path, "w", encoding="utf-8") as f:
+            for h in header_lines:
+                f.write(h + "\n")
+
+            if qpc_present:
+                f.write("# timing_source: qpc_primary_pts_fallback\n")
+                f.write("# qpc_source: time.perf_counter (QPC / steady_clock)\n")
+                f.write(
+                    "# wall_mapping: wall_start + (qpc - steady_start_ns / 1e9)\n"
+                )
+            else:
+                f.write("# timing_source: pts_with_partial_qpc\n")
+                f.write(
+                    "# wall_mapping: wall_start + (pts - steady_start_ns / 1e9)  "
+                    "[QPC coverage < 90%]\n"
+                )
+            f.write("# pts_time_base: seconds\n")
+            f.write("\n")
+
+            for frame_idx in range(n):
+                frame_num = frame_idx + 1
+                pts = frame_pts_times[frame_idx]
+                qpc = (
+                    frame_qpc_times[frame_idx]
+                    if frame_idx < n_qpc
+                    else 0.0
+                )
+
+                # Primary: QPC-based timing when available
+                if qpc > 0:
+                    start_s = max(0.0, qpc - steady_start_s)
+                else:
+                    # Fallback to PTS
+                    start_s = max(0.0, pts - steady_start_s)
+
+                # End time: use next frame's QPC or PTS
+                if frame_idx + 1 < n:
+                    next_qpc = (
+                        frame_qpc_times[frame_idx + 1]
+                        if frame_idx + 1 < n_qpc
+                        else 0.0
+                    )
+                    if next_qpc > 0:
+                        end_s = max(start_s + 0.001, next_qpc - steady_start_s)
+                    else:
+                        next_pts = frame_pts_times[frame_idx + 1]
+                        end_s = max(start_s + 0.001, next_pts - steady_start_s)
+                else:
+                    # Last frame: use PTS fallback interval
+                    end_s = start_s + fallback_interval
+
+                # Absolute wall time
+                actual_wall = self.wall_start + start_s
+                whole_sec = int(actual_wall)
+                nanos = int((actual_wall - whole_sec) * 1e9)
+                ts_str = datetime.fromtimestamp(
+                    whole_sec, tz=timezone.utc
+                ).strftime(self._time_fmt)
+                ts_full = f"{ts_str}.{nanos:09d}"
+
+                # PTS-based offset (for comparison / debugging)
+                pts_offset = max(0.0, pts - steady_start_s)
+
+                # Build entry line
+                parts = [
+                    f"qpc={qpc:.9f}" if qpc > 0 else "qpc=0",
+                    f"pts={pts:.9f}",
+                    f"qpc_offset={start_s:.9f}",
+                    f"pts_offset={pts_offset:.9f}",
+                    f"ts={ts_full}",
+                    f"frame={frame_num}",
+                ]
+
+                f.write(
+                    f"{frame_num}\n"
+                    f"{self._seconds_to_srt_timecode(start_s)} --> "
+                    f"{self._seconds_to_srt_timecode(end_s)}\n"
+                    f"{'  '.join(parts)}\n\n"
+                )
+
+        logger.info(
+            "SRT finalized with QPC-primary timestamps: %d frames "
+            "(QPC coverage: %d/%d = %.0f%%)",
+            n, n_qpc, n_pts,
+            (n_qpc / max(1, n_pts)) * 100,
+        )
+
     def finalize_absolute_times(self, frame_wall_times: list[float]) -> None:
         """Backward-compatible alias for older callers."""
         self.finalize_pts_times(frame_wall_times)
