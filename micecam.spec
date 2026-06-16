@@ -1,12 +1,86 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""
+Usage:
+    uv run pyinstaller --clean micecam.spec
 
+Output: dist/MiceCam.exe (single-file, no console)
+"""
 
+import shutil as _shutil
+import sys as _sys
+from pathlib import Path as _Path
+
+_PROJECT = _Path(SPECPATH)
+_IS_WIN = _sys.platform == "win32"
+_EXE = "ffmpeg.exe" if _IS_WIN else "ffmpeg"
+_MF_HELPER_EXE = "mf_single_frame_helper.exe"
+
+# Locate ffmpeg binary
+_ffmpeg = _PROJECT / "ffmpeg" / _EXE
+if not _ffmpeg.exists():
+    _ffmpeg = _PROJECT / "ffmpeg_bundled" / _EXE
+if not _ffmpeg.exists():
+    _which = _shutil.which(_EXE)
+    if _which:
+        _ffmpeg = _Path(_which)
+    else:
+        raise FileNotFoundError(
+            f"{_EXE} not found. Run scripts/download_ffmpeg.py first, "
+            f"or install ffmpeg and add it to PATH."
+        )
+
+print(f"  Bundling ffmpeg: {_ffmpeg}  ({_ffmpeg.stat().st_size // (1024*1024)} MB)")
+
+_binaries = [(str(_ffmpeg), '.')]
+if _IS_WIN:
+    _mf_helper = _PROJECT / "helpers" / "build" / "Release" / _MF_HELPER_EXE
+    if not _mf_helper.exists():
+        _mf_helper = _PROJECT / "helpers" / _MF_HELPER_EXE
+    if not _mf_helper.exists():
+        raise FileNotFoundError(
+            "mf_single_frame_helper.exe not found. Build it first with "
+            "helpers/build_mf_helper.ps1 from a Visual Studio Developer PowerShell."
+        )
+    print(f"  Bundling Media Foundation helper: {_mf_helper}")
+    _binaries.append((str(_mf_helper), '.'))
+
+# ── Analysis ───────────────────────────────────────────────────────────
 a = Analysis(
-    ['src\\micecam\\main.py'],
-    pathex=[],
-    binaries=[],
+    ['src/micecam/main.py'],
+    pathex=['src'],
+    binaries=_binaries,
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        # PyQt6
+        'PyQt6',
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.QtWidgets',
+        'PyQt6.sip',
+        # micecam — all subpackages (belt-and-suspenders; most are
+        # auto-detected via static imports, but explicit listing
+        # prevents surprises when PyInstaller misses a dynamic path)
+        'micecam',
+        'micecam.camera_manager',
+        'micecam.recorder',
+        'micecam.single_frame_recorder',
+        'micecam.timestamp',
+        'micecam.core',
+        'micecam.core.sync_controller',
+        'micecam.gui',
+        'micecam.gui.main_window',
+        'micecam.gui.camera_panel',
+        'micecam.services',
+        'micecam.services.disk_monitor',
+        'micecam.utils',
+        'micecam.utils.platform',
+        'micecam.utils.resource_path',
+        # stdlib modules that may be missed
+        'logging',
+        'pathlib',
+        'subprocess',
+        'threading',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

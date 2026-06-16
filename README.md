@@ -8,6 +8,7 @@
 - ⚡ 优先使用硬件编码 (VideoToolbox / AMF / NVENC)
 - 📼 MP4 输出 (H.264 / H.265)
 - ⏱️ SRT 纳秒级时间戳 (wall clock + steady clock)
+- 🧪 Windows single_frame_mode：Media Foundation 单帧采集 + QPC arrival timestamp
 - 🖥️ PyQt6 原生界面
 - 📦 打包为单个 exe (PyInstaller + 预编译 ffmpeg)
 
@@ -36,6 +37,13 @@ uv run python scripts/download_ffmpeg.py
 uv run pyinstaller micecam.spec
 
 # 3. 输出在 dist/MiceCam.exe
+```
+
+如需使用 `single_frame_mode`，先在 Visual Studio Developer PowerShell 中构建
+Media Foundation helper：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File helpers/build_mf_helper.ps1
 ```
 
 ## 架构

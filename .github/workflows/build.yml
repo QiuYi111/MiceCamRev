@@ -32,8 +32,18 @@ jobs:
         shell: pwsh
         run: |
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-          Write-Host "Downloading ffmpeg..."
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Write-Host "Downloading ffmpeg (attempt $attempt/3)..."
+              Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+              break
+            } catch {
+              if ($attempt -eq 3) {
+                throw
+              }
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
           Write-Host "Extracting..."
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extracted
           $ffmpeg = Get-ChildItem -Path ffmpeg_extracted -Recurse -Name "ffmpeg.exe" | Where-Object { $_ -like "*bin*" } | Select-Object -First 1
@@ -47,6 +57,13 @@ jobs:
 
       - name: Run smoke test (source)
         run: uv run python -m micecam --check
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build Media Foundation helper
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File helpers/build_mf_helper.ps1
 
       - name: Build EXE with PyInstaller
         run: uv run pyinstaller micecam.spec
@@ -79,7 +96,7 @@ jobs:
         id: release_meta
         shell: pwsh
         run: |
-          $tag = "v0.1.${{ github.run_number }}"
+          $tag = "v0.1.${{ github.run_number }}.${{ github.run_attempt }}"
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "asset=dist/MiceCam-Windows-$tag.zip" >> $env:GITHUB_OUTPUT
 
