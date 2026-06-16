@@ -17,6 +17,10 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
 cl.exe /nologo /std:c++17 /EHsc /O2 /W4 `
     /Fe:$OutExe `
     $Source `
-    mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib propsys.lib
+    mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib propsys.lib
+
+if ($LASTEXITCODE -ne 0) {
+    throw "cl.exe failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "Built $OutExe"
