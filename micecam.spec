@@ -20,6 +20,7 @@ from pathlib import Path as _Path
 _PROJECT = _Path(SPECPATH)
 _IS_WIN = _sys.platform == "win32"
 _EXE = "ffmpeg.exe" if _IS_WIN else "ffmpeg"
+_MF_HELPER_EXE = "mf_single_frame_helper.exe"
 
 # Locate ffmpeg binary
 _ffmpeg = _PROJECT / "ffmpeg" / _EXE
@@ -37,11 +38,24 @@ if not _ffmpeg.exists():
 
 print(f"  Bundling ffmpeg: {_ffmpeg}  ({_ffmpeg.stat().st_size // (1024*1024)} MB)")
 
+_binaries = [(str(_ffmpeg), '.')]
+if _IS_WIN:
+    _mf_helper = _PROJECT / "helpers" / "build" / "Release" / _MF_HELPER_EXE
+    if not _mf_helper.exists():
+        _mf_helper = _PROJECT / "helpers" / _MF_HELPER_EXE
+    if not _mf_helper.exists():
+        raise FileNotFoundError(
+            "mf_single_frame_helper.exe not found. Build it first with "
+            "helpers/build_mf_helper.ps1 from a Visual Studio Developer PowerShell."
+        )
+    print(f"  Bundling Media Foundation helper: {_mf_helper}")
+    _binaries.append((str(_mf_helper), '.'))
+
 # ── Analysis ───────────────────────────────────────────────────────────
 a = Analysis(
     ['src/micecam/main.py'],
     pathex=['src'],
-    binaries=[(str(_ffmpeg), '.')],
+    binaries=_binaries,
     datas=[],
     hiddenimports=[
         # PyQt6
@@ -56,6 +70,7 @@ a = Analysis(
         'micecam',
         'micecam.camera_manager',
         'micecam.recorder',
+        'micecam.single_frame_recorder',
         'micecam.timestamp',
         'micecam.core',
         'micecam.core.sync_controller',

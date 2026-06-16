@@ -4,7 +4,7 @@ SCRIPTS := $(ROOT)scripts/
 OUTPUT  := $(ROOT)output/
 
 .PHONY: help setup run test check build rebuild analyze health ci clean nuke \
-        ffmpeg deps build-only smoke-exe health-all
+        ffmpeg deps build-only smoke-exe health-all mf-helper
 
 # ── help ───────────────────────────────────────────────────────────────
 help:
@@ -16,6 +16,7 @@ help:
 	@echo   make test          Run pytest suite
 	@echo   make check         Smoke test - no GUI
 	@echo   make build         Package standalone .exe
+	@echo   make mf-helper     Build Windows Media Foundation helper
 	@echo   make rebuild       Clean + full build
 	@echo   make analyze       Frame-interval HTML report
 	@echo   make health        Terminal health check
@@ -35,6 +36,9 @@ deps:
 
 setup: ffmpeg deps
 	@echo === Setup complete ===
+
+mf-helper:
+	powershell -ExecutionPolicy Bypass -File "$(ROOT)helpers/build_mf_helper.ps1"
 
 # ── run & test ─────────────────────────────────────────────────────────
 run:
