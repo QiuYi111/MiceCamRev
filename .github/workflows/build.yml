@@ -48,6 +48,13 @@ jobs:
       - name: Run smoke test (source)
         run: uv run python -m micecam --check
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build Media Foundation helper
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File helpers/build_mf_helper.ps1
+
       - name: Build EXE with PyInstaller
         run: uv run pyinstaller micecam.spec
 
