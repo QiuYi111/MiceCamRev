@@ -799,4 +799,4 @@ class CameraPanel(QtWidgets.QGroupBox):
             try:
                 self._recorder.stop()
             except Exception:
-                pass
+                logger.exception("Error stopping recorder during panel shutdown")

@@ -31,6 +31,46 @@ FFMPEG_BUNDLE: dict[str, str] = {
     "Linux": "ffmpeg/ffmpeg",
 }
 MF_HELPER = ROOT / "helpers" / "build" / "Release" / "mf_single_frame_helper.exe"
+HIDDEN_IMPORTS = [
+    "PyQt6",
+    "PyQt6.QtCore",
+    "PyQt6.QtGui",
+    "PyQt6.QtWidgets",
+    "PyQt6.sip",
+    "micecam",
+    "micecam.camera_manager",
+    "micecam.recorder",
+    "micecam.single_frame_recorder",
+    "micecam.timestamp",
+    "micecam.core",
+    "micecam.core.sync_controller",
+    "micecam.gui",
+    "micecam.gui.main_window",
+    "micecam.gui.camera_panel",
+    "micecam.services",
+    "micecam.services.disk_monitor",
+    "micecam.utils",
+    "micecam.utils.platform",
+    "micecam.utils.resource_path",
+    "logging",
+    "pathlib",
+    "subprocess",
+    "threading",
+]
+EXCLUDES = [
+    "tkinter",
+    "unittest",
+    "email",
+    "http",
+    "xmlrpc",
+    "pydoc",
+]
+UPX_EXCLUDES = [
+    "ffmpeg.exe",
+    "Qt6Core.dll",
+    "Qt6Gui.dll",
+    "Qt6Widgets.dll",
+]
 
 
 def ensure_ffmpeg() -> Path:
@@ -89,18 +129,14 @@ def build_spec(ffmpeg_path: Path, mf_helper_path: Path | None = None) -> str:
 
 a = Analysis(
     ['src/micecam/main.py'],
-    pathex=[],
+    pathex=['src'],
     binaries={binaries!r},
     datas=[],
-    hiddenimports=[
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'PyQt6.QtWidgets',
-    ],
+    hiddenimports={HIDDEN_IMPORTS!r},
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=[],
+    excludes={EXCLUDES!r},
     noarchive=False,
     optimize=0,
 )
@@ -118,7 +154,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude={UPX_EXCLUDES!r},
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
@@ -148,7 +184,9 @@ def main() -> None:
         shutil.copy2(ffmpeg_path, dest)
         print(f"[OK] Copied ffmpeg to {dest}")
 
-    # Write spec and run PyInstaller
+    # Write a generated spec and run PyInstaller.  Keep it distinct from the
+    # hand-maintained micecam.spec so the two packaging entrypoints are not
+    # confused during local debugging.
     helper_dest: Path | None = None
     if mf_helper_path is not None:
         helper_dest = bundled_dir / mf_helper_path.name
@@ -157,7 +195,7 @@ def main() -> None:
             print(f"[OK] Copied Media Foundation helper to {helper_dest}")
 
     spec_content = build_spec(dest, helper_dest)
-    spec_path = ROOT / "MiceCam.spec"
+    spec_path = ROOT / "MiceCam.generated.spec"
     spec_path.write_text(spec_content, encoding="utf-8")
 
     print("Running PyInstaller...")

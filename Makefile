@@ -38,7 +38,12 @@ setup: ffmpeg deps
 	@echo === Setup complete ===
 
 mf-helper:
+ifeq ($(OS),Windows_NT)
 	powershell -ExecutionPolicy Bypass -File "$(ROOT)helpers/build_mf_helper.ps1"
+else
+	@echo "mf-helper is Windows-only; run this target from Windows with Visual Studio Developer PowerShell."
+	@exit 1
+endif
 
 # ── run & test ─────────────────────────────────────────────────────────
 run:

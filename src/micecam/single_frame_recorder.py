@@ -145,6 +145,7 @@ class SingleFrameRecorder:
             else:
                 self._mark_failed("helper did not report ready within 5 seconds")
                 self._terminate_helper()
+            self._join_reader_threads()
             self._write_metadata()
             raise RuntimeError(f"single_frame_mode failed to start: {self._failure_reason}")
 
@@ -161,6 +162,8 @@ class SingleFrameRecorder:
                 self._mark_failed(f"helper exited during startup with code {self._helper_exit_code}")
             else:
                 self._mark_failed("helper did not report ready")
+                self._terminate_helper()
+                self._join_reader_threads()
             raise RuntimeError(f"single_frame_mode failed to start: {self._failure_reason}")
 
     def stop(self) -> tuple[Path, Path]:
@@ -188,8 +191,13 @@ class SingleFrameRecorder:
             self._stdout_thread.join(timeout=2)
         if self._stderr_thread:
             self._stderr_thread.join(timeout=2)
-        if self._helper_exit_code not in (0, None) and self._failure_reason is None:
-            self._mark_failed(f"helper exited with code {self._helper_exit_code}")
+        if self._helper_exit_code not in (0, None):
+            message = f"helper exited with code {self._helper_exit_code}"
+            if self._failure_reason is None:
+                self._mark_failed(message)
+            elif message not in self.warnings:
+                self.warnings.append(message)
+                self.warnings = self.warnings[-20:]
 
         self._write_metadata()
         if self._failure_reason:
@@ -332,14 +340,22 @@ class SingleFrameRecorder:
         try:
             self._process.terminate()
             self._process.wait(timeout=3)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Could not terminate single_frame_mode helper: %s", exc)
             try:
                 self._process.kill()
                 self._process.wait(timeout=3)
-            except Exception:
+            except Exception as kill_exc:
+                logger.warning("Could not kill single_frame_mode helper: %s", kill_exc)
                 pass
         self._helper_exit_code = self._process.returncode
         self._is_recording = False
+
+    def _join_reader_threads(self) -> None:
+        if self._stdout_thread:
+            self._stdout_thread.join(timeout=2)
+        if self._stderr_thread:
+            self._stderr_thread.join(timeout=2)
 
     def _mark_failed(self, reason: str) -> None:
         if self._failure_reason is None:

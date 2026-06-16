@@ -37,6 +37,12 @@ struct Options {
     size_t ring_capacity = 256;
 };
 
+struct CaptureMode {
+    int width = 0;
+    int height = 0;
+    std::string format;
+};
+
 struct Frame {
     uint64_t frame_id = 0;
     uint64_t callback_seq = 0;
@@ -59,8 +65,10 @@ struct SharedState {
     size_t capacity = 256;
     bool capture_done = false;
     std::atomic<bool> stop_requested = false;
+    std::atomic<bool> capture_error = false;
     std::atomic<uint64_t> frame_count = 0;
     std::atomic<uint64_t> drop_count = 0;
+    std::atomic<uint64_t> lock_failure_count = 0;
 };
 
 static uint64_t g_qpc_frequency = 0;
@@ -191,7 +199,7 @@ static HRESULT create_source_reader(const Options& options, IMFSourceReader** re
     return hr;
 }
 
-static HRESULT configure_reader(IMFSourceReader* reader, const Options& options, GUID* selected_subtype) {
+static HRESULT configure_reader(IMFSourceReader* reader, const Options& options, CaptureMode* mode) {
     ComPtr<IMFMediaType> type;
     HRESULT hr = MFCreateMediaType(&type);
     if (FAILED(hr)) return hr;
@@ -214,8 +222,19 @@ static HRESULT configure_reader(IMFSourceReader* reader, const Options& options,
     ComPtr<IMFMediaType> current;
     hr = reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &current);
     if (SUCCEEDED(hr)) {
-        current->GetGUID(MF_MT_SUBTYPE, selected_subtype);
+        GUID selected_subtype = GUID_NULL;
+        current->GetGUID(MF_MT_SUBTYPE, &selected_subtype);
+        mode->format = subtype_name(selected_subtype);
+        UINT32 actual_width = 0;
+        UINT32 actual_height = 0;
+        if (SUCCEEDED(MFGetAttributeSize(current.Get(), MF_MT_FRAME_SIZE, &actual_width, &actual_height))) {
+            mode->width = static_cast<int>(actual_width);
+            mode->height = static_cast<int>(actual_height);
+        }
     }
+    if (mode->width <= 0) mode->width = options.width;
+    if (mode->height <= 0) mode->height = options.height;
+    if (mode->format.empty()) mode->format = "unknown";
     return hr;
 }
 
@@ -284,10 +303,11 @@ static void writer_loop(SharedState& state, const Options& options, const std::s
     }
 }
 
-static void capture_loop(SharedState& state, IMFSourceReader* reader, const Options& options, const std::string& format) {
+static void capture_loop(SharedState& state, IMFSourceReader* reader, const CaptureMode& mode) {
     uint64_t last_arrival = 0;
     int64_t last_pts = 0;
     uint64_t callback_seq = 0;
+    uint64_t last_drop_emit_count = 0;
     for (;;) {
         if (state.stop_requested.load()) break;
         DWORD stream_index = 0;
@@ -305,6 +325,8 @@ static void capture_loop(SharedState& state, IMFSourceReader* reader, const Opti
         ++callback_seq;
         if (FAILED(hr)) {
             emit_json("\"event\":\"error\",\"message\":\"ReadSample failed\"");
+            state.capture_error.store(true);
+            state.stop_requested.store(true);
             break;
         }
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
@@ -320,7 +342,12 @@ static void capture_loop(SharedState& state, IMFSourceReader* reader, const Opti
         DWORD max_len = 0;
         DWORD current_len = 0;
         hr = buffer->Lock(&data, &max_len, &current_len);
-        if (FAILED(hr)) continue;
+        if (FAILED(hr)) {
+            uint64_t failures = state.lock_failure_count.fetch_add(1) + 1;
+            emit_json("\"event\":\"warning\",\"message\":\"Buffer Lock failed\",\"lock_failure_count\":" +
+                      std::to_string(failures));
+            continue;
+        }
 
         Frame frame;
         frame.frame_id = state.frame_count.fetch_add(1) + 1;
@@ -329,16 +356,20 @@ static void capture_loop(SharedState& state, IMFSourceReader* reader, const Opti
         frame.arrival_delta_ms = last_arrival ? static_cast<double>(arrival - last_arrival) / 1000000.0 : 0.0;
         frame.mf_pts_100ns = timestamp;
         frame.mf_pts_delta_ms = last_pts ? static_cast<double>(timestamp - last_pts) / 10000.0 : 0.0;
-        frame.width = options.width;
-        frame.height = options.height;
-        frame.format = format;
+        frame.width = mode.width;
+        frame.height = mode.height;
+        frame.format = mode.format;
         frame.payload.assign(data, data + current_len);
         buffer->Unlock();
         last_arrival = arrival;
         last_pts = timestamp;
 
         if (!push_frame(state, std::move(frame))) {
-            emit_json("\"event\":\"dropped\",\"drop_count\":" + std::to_string(state.drop_count.load()));
+            uint64_t drop_count = state.drop_count.load();
+            if (drop_count == 1 || drop_count % 30 == 0 || drop_count - last_drop_emit_count >= 30) {
+                last_drop_emit_count = drop_count;
+                emit_json("\"event\":\"dropped\",\"drop_count\":" + std::to_string(drop_count));
+            }
         }
         uint64_t count = state.frame_count.load();
         if (count % 30 == 0) {
@@ -395,29 +426,36 @@ int main(int argc, char** argv) {
         hr = create_source_reader(options, &reader);
         if (FAILED(hr)) throw std::runtime_error("Could not open Media Foundation camera source");
 
-        GUID selected_subtype = GUID_NULL;
-        hr = configure_reader(reader.Get(), options, &selected_subtype);
+        CaptureMode mode;
+        hr = configure_reader(reader.Get(), options, &mode);
         if (FAILED(hr)) throw std::runtime_error("Could not configure Media Foundation capture mode");
-        std::string format = subtype_name(selected_subtype);
 
         SharedState state;
         state.capacity = options.ring_capacity;
 
         emit_json("\"event\":\"ready\",\"qpc_frequency\":" + std::to_string(g_qpc_frequency) +
-                  ",\"format\":\"" + json_escape(format) + "\"");
+                  ",\"format\":\"" + json_escape(mode.format) + "\",\"width\":" +
+                  std::to_string(mode.width) + ",\"height\":" + std::to_string(mode.height));
 
-        std::thread writer([&] { writer_loop(state, options, format); });
-        std::thread capture([&] { capture_loop(state, reader.Get(), options, format); });
+        std::thread writer([&] { writer_loop(state, options, mode.format); });
+        std::thread capture([&] { capture_loop(state, reader.Get(), mode); });
 
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line == "q" || line == "quit" || line == "stop") break;
-        }
-        state.stop_requested.store(true);
+        std::thread command([&] {
+            for (std::string line; std::getline(std::cin, line); ) {
+                if (line == "q" || line == "quit" || line == "stop") {
+                    state.stop_requested.store(true);
+                    break;
+                }
+            }
+            state.stop_requested.store(true);
+        });
+        command.detach();
+
         capture.join();
         writer.join();
 
-        emit_json("\"event\":\"stopped\",\"stop_reason\":\"user\",\"frame_count\":" +
+        std::string stop_reason = state.capture_error.load() ? "capture_error" : "user";
+        emit_json("\"event\":\"stopped\",\"stop_reason\":\"" + stop_reason + "\",\"frame_count\":" +
                   std::to_string(state.frame_count.load()) + ",\"drop_count\":" +
                   std::to_string(state.drop_count.load()));
         MFShutdown();

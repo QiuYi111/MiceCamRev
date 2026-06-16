@@ -61,3 +61,21 @@ def test_backend_combo_creates_single_frame_recorder_on_windows(tmp_path: Path) 
     assert isinstance(recorder, SingleFrameRecorder)
     assert recorder.camera_id == "video=Test Camera"
     assert recorder.camera_device_number == 1
+
+
+def test_shutdown_logs_recorder_stop_errors() -> None:
+    _app()
+    with mock.patch.object(CameraPanel, "_start_preview"):
+        panel = CameraPanel(0, [_camera()])
+    recorder = mock.Mock()
+    recorder.is_recording.return_value = True
+    recorder.stop.side_effect = RuntimeError("stop failed")
+    panel.set_recorder(recorder)
+
+    with (
+        mock.patch.object(panel, "_stop_preview"),
+        mock.patch("micecam.gui.camera_panel.logger") as logger,
+    ):
+        panel.shutdown()
+
+    logger.exception.assert_called_once()
