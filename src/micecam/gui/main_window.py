@@ -194,6 +194,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel1._stop_preview()
         self._panel2._stop_preview()
 
+        # Brief settle: DirectShow needs ~100-200 ms to fully release
+        # the camera device handle after the ffmpeg process exits.
+        # Without this, a Media Foundation source reader may fail to
+        # activate the same camera with "Could not open source".
+        import time as _time
+        _time.sleep(0.3)
+
         try:
             self._sync.start_both(
                 rec_a, cfg1["resolution"], cfg1["fps"], cfg1["codec"],
@@ -214,10 +221,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Update panel UIs
         self._panel1._update_ui_recording_started(
-            rec_a._output_path.name, rec_a.camera_name,
+            rec_a.output_path.name if rec_a.output_path else "recording",
+            rec_a.camera_name,
         )
         self._panel2._update_ui_recording_started(
-            rec_b._output_path.name, rec_b.camera_name,
+            rec_b.output_path.name if rec_b.output_path else "recording",
+            rec_b.camera_name,
         )
 
         # Update sync buttons

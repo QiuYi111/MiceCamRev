@@ -165,6 +165,12 @@ class SingleFrameRecorder:
                 self._terminate_helper()
                 self._join_reader_threads()
             raise RuntimeError(f"single_frame_mode failed to start: {self._failure_reason}")
+        # Ready event fired — but check if an error slipped in before/after
+        if self._failure_reason:
+            self._is_recording = False
+            self._terminate_helper()
+            self._join_reader_threads()
+            raise RuntimeError(f"single_frame_mode failed to start: {self._failure_reason}")
 
     def stop(self) -> tuple[Path, Path]:
         """Stop the helper, flush metadata, and return (session_dir, frame_log)."""
@@ -201,7 +207,13 @@ class SingleFrameRecorder:
 
         self._write_metadata()
         if self._failure_reason:
-            raise RuntimeError(self._failure_reason)
+            # Distinguish startup failure (0 frames, never really recorded)
+            # from mid-recording failure (had frames, then crashed).
+            if self.frame_count == 0:
+                logger.warning("single_frame_mode stopped with startup failure: %s",
+                               self._failure_reason)
+            else:
+                raise RuntimeError(self._failure_reason)
         return (self._session_dir or Path(), self._frame_log_path or Path())
 
     def is_recording(self) -> bool:
@@ -269,10 +281,15 @@ class SingleFrameRecorder:
         if self._session_dir is None:
             raise RuntimeError("session directory has not been initialized")
         w, h = resolution
+        # The helper uses --camera-name (if non-empty) for MF device
+        # enumeration, falling back to --camera-id.  camera_name may
+        # carry a "#1"/"#2" display suffix that doesn't match the
+        # driver's friendly name.  Use camera_id exclusively so the
+        # helper's strip_dshow_prefix logic handles device matching;
+        # device_number disambiguates same-name cameras.
         cmd = [
             str(helper_path),
             "--camera-id", self.camera_id,
-            "--camera-name", self.camera_name,
             "--width", str(w),
             "--height", str(h),
             "--fps", str(fps),
@@ -327,7 +344,8 @@ class SingleFrameRecorder:
             self.warnings = self.warnings[-20:]
         elif kind == "error":
             self._mark_failed(str(event.get("message", "helper error")))
-            self._ready_event.set()
+            # Do NOT set _ready_event on error — the helper failed to start.
+            # wait_until_ready() will time out and raise a clear startup error.
         elif kind == "stopped":
             self.stop_reason = str(event.get("stop_reason", "helper_stopped"))
             self.frame_count = int(event.get("frame_count", self.frame_count))

@@ -80,7 +80,9 @@ class SyncController:
             self.wall_start, self.steady_start,
         )
 
-        # 2. Launch both ffmpeg processes back-to-back (no blocking between them)
+        # 2. Launch both processes back-to-back.
+        #     A small stagger prevents Media Foundation enumeration
+        #     contention when both cameras share a USB controller.
         try:
             rec_a.start(
                 resolution=res_a, fps=fps_a, codec=codec_a,
@@ -88,6 +90,8 @@ class SyncController:
                 wait_for_ready=False,
             )
             self._recorders.append(rec_a)
+
+            time.sleep(0.1)  # let first helper finish MF enumeration
 
             rec_b.start(
                 resolution=res_b, fps=fps_b, codec=codec_b,

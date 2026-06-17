@@ -31,3 +31,4 @@ ffmpeg_bundled/
 .pytest_cache/
 .claude/
 output/
+test_output/

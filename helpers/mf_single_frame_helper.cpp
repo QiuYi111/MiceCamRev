@@ -252,19 +252,17 @@ static bool push_frame(SharedState& state, Frame&& frame) {
 }
 
 static void writer_loop(SharedState& state, const Options& options, const std::string& format) {
-    fs::create_directories(options.output_dir / "frames");
+    (void)format;  // unified frames.bin path — format-agnostic
     std::ofstream log(options.output_dir / "frame_log.csv", std::ios::binary);
     log << "frame_id,arrival_qpc_ns,arrival_delta_ms,mf_pts_100ns,mf_pts_delta_ms,"
            "callback_seq,width,height,format,bytes,drop_count,ring_buffer_size_after_push,"
-           "write_start_qpc_ns,write_end_qpc_ns,write_latency_ms\n";
+           "write_start_qpc_ns,write_end_qpc_ns,write_latency_ms
+";
 
-    std::ofstream raw_bin;
-    std::ofstream raw_idx;
-    if (format != "mjpg") {
-        raw_bin.open(options.output_dir / "frames.bin", std::ios::binary);
-        raw_idx.open(options.output_dir / "frames.idx.csv", std::ios::binary);
-        raw_idx << "frame_id,offset,bytes,arrival_qpc_ns,mf_pts_100ns,width,height,format\n";
-    }
+    std::ofstream raw_bin(options.output_dir / "frames.bin", std::ios::binary);
+    std::ofstream raw_idx(options.output_dir / "frames.idx.csv", std::ios::binary);
+    raw_idx << "frame_id,offset,bytes,arrival_qpc_ns,mf_pts_100ns,width,height,format
+";
 
     uint64_t raw_offset = 0;
     for (;;) {
@@ -278,18 +276,14 @@ static void writer_loop(SharedState& state, const Options& options, const std::s
         }
 
         uint64_t write_start = qpc_ns();
-        if (frame.format == "mjpg") {
-            std::ostringstream name;
-            name << "frame_" << std::setw(6) << std::setfill('0') << frame.frame_id << ".jpg";
-            std::ofstream jpg(options.output_dir / "frames" / name.str(), std::ios::binary);
-            jpg.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
-        } else {
-            raw_bin.write(reinterpret_cast<const char*>(frame.payload.data()), static_cast<std::streamsize>(frame.payload.size()));
-            raw_idx << frame.frame_id << "," << raw_offset << "," << frame.payload.size() << ","
-                    << frame.arrival_qpc_ns << "," << frame.mf_pts_100ns << ","
-                    << frame.width << "," << frame.height << "," << frame.format << "\n";
-            raw_offset += frame.payload.size();
-        }
+        raw_bin.write(reinterpret_cast<const char*>(frame.payload.data()),
+                      static_cast<std::streamsize>(frame.payload.size()));
+        raw_idx << frame.frame_id << "," << raw_offset << "," << frame.payload.size() << ","
+                << frame.arrival_qpc_ns << "," << frame.mf_pts_100ns << ","
+                << frame.width << "," << frame.height << "," << frame.format << "
+";
+        raw_offset += frame.payload.size();
+
         uint64_t write_end = qpc_ns();
         double latency_ms = static_cast<double>(write_end - write_start) / 1000000.0;
 
@@ -299,7 +293,8 @@ static void writer_loop(SharedState& state, const Options& options, const std::s
             << frame.callback_seq << "," << frame.width << "," << frame.height << ","
             << frame.format << "," << frame.payload.size() << "," << frame.drop_count << ","
             << frame.occupancy_after_push << "," << write_start << "," << write_end << ","
-            << latency_ms << "\n";
+            << latency_ms << "
+";
     }
 }
 
