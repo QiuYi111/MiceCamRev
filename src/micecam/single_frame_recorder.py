@@ -50,7 +50,6 @@ class SingleFrameRecorder:
         self._is_recording = False
 
         self._session_dir: Path | None = None
-        self._frames_dir: Path | None = None
         self._frame_log_path: Path | None = None
         self._metadata_path: Path | None = None
         self._helper_path: Path | None = None
@@ -247,10 +246,8 @@ class SingleFrameRecorder:
         safe_name = self.camera_name.replace(" ", "_").replace('"', "")[:30]
         stem = f"{safe_name}_{timestamp}" if safe_name else f"cam_{timestamp}"
         session_dir = self.output_dir / safe_name / date_str / f"{stem}_single_frames"
-        frames_dir = session_dir / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
         self._session_dir = session_dir
-        self._frames_dir = frames_dir
         self._frame_log_path = session_dir / "frame_log.csv"
         self._metadata_path = session_dir / "metadata.json"
 
@@ -413,7 +410,6 @@ class SingleFrameRecorder:
             },
             "files": {
                 "session_dir": str(self._session_dir) if self._session_dir else None,
-                "frames_dir": str(self._frames_dir) if self._frames_dir else None,
                 "frame_log": str(self._frame_log_path) if self._frame_log_path else None,
                 "frames_bin": str((self._session_dir / "frames.bin")) if self._session_dir else None,
                 "frames_index": str((self._session_dir / "frames.idx.csv")) if self._session_dir else None,
