@@ -70,11 +70,16 @@ a = Analysis(
         'micecam.gui',
         'micecam.gui.main_window',
         'micecam.gui.camera_panel',
+        'micecam.gui.processor_window',
+        'micecam.processor',
         'micecam.services',
         'micecam.services.disk_monitor',
         'micecam.utils',
         'micecam.utils.platform',
         'micecam.utils.resource_path',
+        # data-science deps (processor)
+        'numpy',
+        'PIL',
         # stdlib modules that may be missed
         'logging',
         'pathlib',

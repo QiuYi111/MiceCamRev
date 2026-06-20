@@ -328,6 +328,15 @@ class CameraPanel(QtWidgets.QGroupBox):
         )
         form.addRow("Backend:", self._backend_combo)
 
+        self._save_format_combo = QtWidgets.QComboBox()
+        self._save_format_combo.addItem("bin (single file)", "bin")
+        self._save_format_combo.addItem("single (per-frame JPEG)", "single")
+        self._save_format_combo.setToolTip(
+            "bin: all frames in one frames.bin + index (fast transfer).\n"
+            "single: individual JPEG files per frame (easy browsing)."
+        )
+        form.addRow("Save format:", self._save_format_combo)
+
         # Output directory
         dir_row = QtWidgets.QHBoxLayout()
         self._output_edit = QtWidgets.QLineEdit(str(Path.cwd() / "output"))
@@ -673,6 +682,7 @@ class CameraPanel(QtWidgets.QGroupBox):
                 output_dir=output_dir,
                 camera_device_number=cam.device_number,
                 pixel_format=input_codec or "auto",
+                save_format=self._save_format_combo.currentData() or "bin",
             )
         return Recorder(
             camera_id=cam.platform_id,

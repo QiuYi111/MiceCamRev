@@ -13,6 +13,7 @@ from PyQt6 import QtCore, QtWidgets
 from micecam.camera_manager import CameraInfo, list_cameras
 from micecam.core.sync_controller import SyncController
 from micecam.gui.camera_panel import CameraPanel
+from micecam.gui.processor_window import ProcessorWindow
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,11 @@ class MainWindow(QtWidgets.QMainWindow):
         quit_action = file_menu.addAction("&Quit")
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
+
+        tools_menu = menubar.addMenu("&Tools")
+        proc_action = tools_menu.addAction("&Process Experiment...")
+        proc_action.setShortcut("Ctrl+P")
+        proc_action.triggered.connect(self._open_processor)
 
         help_menu = menubar.addMenu("&Help")
         about_action = help_menu.addAction("&About")
@@ -285,6 +291,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel2._start_preview(self._panel2._current_camera)
 
     # ── About ────────────────────────────────────────────────────────
+
+    def _open_processor(self) -> None:
+        """Open the motorvids pipeline processor dialog."""
+        dlg = ProcessorWindow(self)
+        dlg.exec()
 
     def _show_about(self) -> None:
         QtWidgets.QMessageBox.about(

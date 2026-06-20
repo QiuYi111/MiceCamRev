@@ -34,6 +34,7 @@ class SingleFrameRecorder:
         output_dir: Path = Path("./output"),
         camera_device_number: int | None = None,
         pixel_format: str = "auto",
+        save_format: str = "bin",
         ring_buffer_capacity: int = 256,
     ) -> None:
         self.camera_id = camera_id
@@ -41,6 +42,7 @@ class SingleFrameRecorder:
         self.output_dir = Path(output_dir)
         self.camera_device_number = camera_device_number
         self.pixel_format = pixel_format
+        self.save_format = save_format  # "bin" or "single"
         self.ring_buffer_capacity = ring_buffer_capacity
 
         self._process: Optional[subprocess.Popen] = None
@@ -247,6 +249,8 @@ class SingleFrameRecorder:
         stem = f"{safe_name}_{timestamp}" if safe_name else f"cam_{timestamp}"
         session_dir = self.output_dir / safe_name / date_str / f"{stem}_single_frames"
         session_dir.mkdir(parents=True, exist_ok=True)
+        if self.save_format == "single":
+            (session_dir / "frames").mkdir(parents=True, exist_ok=True)
         self._session_dir = session_dir
         self._frame_log_path = session_dir / "frame_log.csv"
         self._metadata_path = session_dir / "metadata.json"
@@ -291,6 +295,7 @@ class SingleFrameRecorder:
             "--height", str(h),
             "--fps", str(fps),
             "--pixel-format", self.pixel_format,
+            "--save-format", self.save_format,
             "--output-dir", str(self._session_dir),
             "--ring-buffer-capacity", str(self.ring_buffer_capacity),
             "--shared-wall-start", repr(wall_start),
@@ -400,6 +405,7 @@ class SingleFrameRecorder:
                 "resolution": self._requested_resolution,
                 "fps": self._requested_fps,
                 "pixel_format": self.pixel_format,
+                "save_format": self.save_format,
                 "reported_format": self.capture_format,
                 "ring_buffer_capacity": self.ring_buffer_capacity,
                 "qpc_frequency": self.qpc_frequency,
