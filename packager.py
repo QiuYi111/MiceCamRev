@@ -30,6 +30,47 @@ FFMPEG_BUNDLE: dict[str, str] = {
     "Windows": "ffmpeg/ffmpeg.exe",
     "Linux": "ffmpeg/ffmpeg",
 }
+MF_HELPER = ROOT / "helpers" / "build" / "Release" / "mf_single_frame_helper.exe"
+HIDDEN_IMPORTS = [
+    "PyQt6",
+    "PyQt6.QtCore",
+    "PyQt6.QtGui",
+    "PyQt6.QtWidgets",
+    "PyQt6.sip",
+    "micecam",
+    "micecam.camera_manager",
+    "micecam.recorder",
+    "micecam.single_frame_recorder",
+    "micecam.timestamp",
+    "micecam.core",
+    "micecam.core.sync_controller",
+    "micecam.gui",
+    "micecam.gui.main_window",
+    "micecam.gui.camera_panel",
+    "micecam.services",
+    "micecam.services.disk_monitor",
+    "micecam.utils",
+    "micecam.utils.platform",
+    "micecam.utils.resource_path",
+    "logging",
+    "pathlib",
+    "subprocess",
+    "threading",
+]
+EXCLUDES = [
+    "tkinter",
+    "unittest",
+    "email",
+    "http",
+    "xmlrpc",
+    "pydoc",
+]
+UPX_EXCLUDES = [
+    "ffmpeg.exe",
+    "Qt6Core.dll",
+    "Qt6Gui.dll",
+    "Qt6Widgets.dll",
+]
 
 
 def ensure_ffmpeg() -> Path:
@@ -53,6 +94,19 @@ def ensure_ffmpeg() -> Path:
     sys.exit(1)
 
 
+def ensure_mf_helper() -> Path | None:
+    """Return the Windows Media Foundation helper when packaging on Windows."""
+    if platform.system() != "Windows":
+        return None
+    if MF_HELPER.exists():
+        print(f"[OK] Using Media Foundation helper: {MF_HELPER}")
+        return MF_HELPER
+    print("ERROR: mf_single_frame_helper.exe not found.")
+    print("Build it first from a Visual Studio Developer PowerShell:")
+    print("  powershell -ExecutionPolicy Bypass -File helpers/build_mf_helper.ps1")
+    sys.exit(1)
+
+
 def clean_dist() -> None:
     """Remove previous build artifacts (best-effort, skips locked files)."""
     for d in ["dist", "build"]:
@@ -62,28 +116,27 @@ def clean_dist() -> None:
             print(f"[OK] Cleaned {d}/")
 
 
-def build_spec(ffmpeg_path: Path) -> str:
+def build_spec(ffmpeg_path: Path, mf_helper_path: Path | None = None) -> str:
     """Generate PyInstaller .spec file content."""
     # Use posix path to avoid backslash escape issues in the spec file
     # (e.g. \f, \U in Windows paths become Python escape sequences)
     binary_path = ffmpeg_path.as_posix()
+    binaries = [(binary_path, ".")]
+    if mf_helper_path is not None:
+        binaries.append((mf_helper_path.as_posix(), "."))
     return f"""# -*- mode: python ; coding: utf-8 -*-
 # Auto-generated spec for MiceCam
 
 a = Analysis(
     ['src/micecam/main.py'],
-    pathex=[],
-    binaries=[('{binary_path}', '.')],
+    pathex=['src'],
+    binaries={binaries!r},
     datas=[],
-    hiddenimports=[
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'PyQt6.QtWidgets',
-    ],
+    hiddenimports={HIDDEN_IMPORTS!r},
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=[],
+    excludes={EXCLUDES!r},
     noarchive=False,
     optimize=0,
 )
@@ -101,7 +154,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude={UPX_EXCLUDES!r},
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
@@ -120,6 +173,7 @@ def main() -> None:
     print("=" * 60)
 
     ffmpeg_path = ensure_ffmpeg()
+    mf_helper_path = ensure_mf_helper()
     clean_dist()
 
     # Copy ffmpeg to a temp location relative to the package
@@ -130,9 +184,18 @@ def main() -> None:
         shutil.copy2(ffmpeg_path, dest)
         print(f"[OK] Copied ffmpeg to {dest}")
 
-    # Write spec and run PyInstaller
-    spec_content = build_spec(dest)
-    spec_path = ROOT / "MiceCam.spec"
+    # Write a generated spec and run PyInstaller.  Keep it distinct from the
+    # hand-maintained micecam.spec so the two packaging entrypoints are not
+    # confused during local debugging.
+    helper_dest: Path | None = None
+    if mf_helper_path is not None:
+        helper_dest = bundled_dir / mf_helper_path.name
+        if mf_helper_path != helper_dest:
+            shutil.copy2(mf_helper_path, helper_dest)
+            print(f"[OK] Copied Media Foundation helper to {helper_dest}")
+
+    spec_content = build_spec(dest, helper_dest)
+    spec_path = ROOT / "MiceCam.generated.spec"
     spec_path.write_text(spec_content, encoding="utf-8")
 
     print("Running PyInstaller...")

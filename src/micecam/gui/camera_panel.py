@@ -28,6 +28,7 @@ from micecam.camera_manager import (
     get_ffmpeg_path,
 )
 from micecam.recorder import Recorder
+from micecam.single_frame_recorder import SingleFrameRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +318,15 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._codec_combo = QtWidgets.QComboBox()
         self._codec_combo.addItems(["H.264", "H.265 (HEVC)"])
         form.addRow("Codec:", self._codec_combo)
+
+        self._backend_combo = QtWidgets.QComboBox()
+        self._backend_combo.addItem("FFmpeg video", "ffmpeg_video")
+        self._backend_combo.addItem("Single frame mode", "single_frame_mode")
+        self._backend_combo.setToolTip(
+            "FFmpeg video records MP4/SRT. Single frame mode is Windows-only "
+            "and records per-frame Media Foundation arrival timestamps."
+        )
+        form.addRow("Backend:", self._backend_combo)
 
         # Output directory
         dir_row = QtWidgets.QHBoxLayout()
@@ -632,7 +642,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         else:
             self._start_recording()
 
-    def create_recorder(self) -> Recorder | None:
+    def create_recorder(self) -> Recorder | SingleFrameRecorder | None:
         """
         Build a configured (but not started) Recorder from the current UI settings.
 
@@ -652,10 +662,18 @@ class CameraPanel(QtWidgets.QGroupBox):
         if not input_codec and not cam.mode_codecs:
             input_codec = cam.native_codec
         logger.info(
-            "Recording config for %s: %dx%d @ %d fps input_codec=%s id=%r device_number=%r",
+            "Recording config for %s: %dx%d @ %d fps input_codec=%s backend=%s id=%r device_number=%r",
             cam.name, res[0], res[1], fps,
-            input_codec, cam.platform_id, cam.device_number,
+            input_codec, self._backend_combo.currentData(), cam.platform_id, cam.device_number,
         )
+        if self._backend_combo.currentData() == "single_frame_mode":
+            return SingleFrameRecorder(
+                camera_id=cam.platform_id,
+                camera_name=cam.name,
+                output_dir=output_dir,
+                camera_device_number=cam.device_number,
+                pixel_format=input_codec or "auto",
+            )
         return Recorder(
             camera_id=cam.platform_id,
             camera_name=cam.name,
@@ -697,7 +715,7 @@ class CameraPanel(QtWidgets.QGroupBox):
             "border-radius: 4px; padding: 6px 16px; }"
             "QPushButton:hover { background: #e74c3c; }"
         )
-        self._status_label.setText(f"✓  Saved: {mp4_name}  |  SRT: {srt_name}")
+        self._status_label.setText(f"✓  Saved: {mp4_name}  |  Log: {srt_name}")
         self._status_label.setStyleSheet("color: #27ae60; font-size: 12px;")
         cam_name = self._current_camera.name if self._current_camera else ""
         self.setTitle(f"Camera {self.panel_id + 1} — {cam_name}")
@@ -781,4 +799,4 @@ class CameraPanel(QtWidgets.QGroupBox):
             try:
                 self._recorder.stop()
             except Exception:
-                pass
+                logger.exception("Error stopping recorder during panel shutdown")
